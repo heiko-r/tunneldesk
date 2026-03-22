@@ -1,0 +1,20 @@
+[logging]
+stdout_level = "basic"
+
+[capture]
+max_stored_requests = 1000
+
+[[tunnels]]
+name = "webapp"
+socket_path = "/tmp/tunnel-webapp.sock"
+target_port = 8080
+
+[[tunnels]]
+name = "api"
+socket_path = "/tmp/tunnel-api.sock"
+target_port = 3000
+
+[[tunnels]]
+name = "dev-server"
+socket_path = "/tmp/tunnel-dev-server.sock"
+target_port = 5173
