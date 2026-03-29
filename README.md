@@ -35,17 +35,21 @@ Create a `config.toml` file:
 ```toml
 [logging]
 stdout_level = "basic"
+max_request_body_size = 1024
 
 [capture]
 max_stored_requests = 1000
+max_request_body_size = 10485760
 
 [[tunnels]]
 name = "webapp"
+domain = "webapp.example.com"
 socket_path = "/tmp/webapp.sock"
 target_port = 8080
 
 [[tunnels]]
 name = "api"
+domain = "api.example.com"
 socket_path = "/tmp/api.sock"
 target_port = 3000
 ```

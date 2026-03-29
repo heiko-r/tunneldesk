@@ -1,20 +1,27 @@
 [logging]
-stdout_level = "basic"
+stdout_level = "full"
 
 [capture]
 max_stored_requests = 1000
+max_request_body_size = 10485760
+
+[gui]
+port = 8081
 
 [[tunnels]]
 name = "webapp"
+domain = "payments-laptop.rothkranz.net"
 socket_path = "/tmp/tunnel-webapp.sock"
 target_port = 8080
 
 [[tunnels]]
 name = "api"
+domain = "assets-laptop.rothkranz.net"
 socket_path = "/tmp/tunnel-api.sock"
-target_port = 3000
+target_port = 8019
 
 [[tunnels]]
 name = "dev-server"
+domain = "dev.example.com"
 socket_path = "/tmp/tunnel-dev-server.sock"
 target_port = 5173

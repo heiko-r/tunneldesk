@@ -15,7 +15,9 @@
                 ]
             },
             "args": [],
-            "gracefulShutdown": "SIGTERM"
+            "gracefulShutdown": "SIGTERM",
+            "sourceLanguages": ["rust"],
+            "expressions": "native"
         },
         {
             "name": "Debug unit tests in executable 'tunneldesk'",
@@ -28,5 +30,12 @@
                 ]
             }
         }
-    ]
+    ],
+    "setupCommands": [
+        {
+            "description": "Disable target async",
+            "text": "set target-async off",
+            "ignoreFailures": true
+        }
+]
 }

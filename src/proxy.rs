@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
@@ -9,22 +10,75 @@ use tracing::{debug, error, info};
 use crate::capture::Capture;
 use crate::config::TunnelConfig;
 
+/// Streaming HTTP/WebSocket capture state machine.
+///
+/// The TeeReader wraps an inner `AsyncRead` and forwards all bytes unchanged to
+/// the caller (used as a source for `tokio::io::copy`). As a side-channel it
+/// accumulates bytes needed to reconstruct and capture HTTP messages or
+/// WebSocket frames, respecting the configured body-size cap.
+#[derive(Debug)]
+enum TeeReaderState {
+    /// Scanning the accumulation buffer for the HTTP header terminator
+    /// (`\r\n\r\n`). `scan_pos` is the earliest buffer index not yet scanned,
+    /// so each poll resumes where it left off rather than rescanning from the
+    /// beginning (avoids O(n²) work on large responses).
+    FindingHeaders { scan_pos: usize },
+
+    /// HTTP headers have been parsed.  Accumulating body bytes until
+    /// `capture_limit` bytes are available, then the capture task is dispatched.
+    CollectingBody {
+        /// Offset into `buf` where the body begins.
+        header_end: usize,
+        /// Declared `Content-Length` value (0 if absent).
+        content_length: usize,
+        /// `min(content_length, max_body_size)` – the number of body bytes to
+        /// capture and buffer.
+        capture_limit: usize,
+    },
+
+    /// Capture has been dispatched.  The message body extends beyond
+    /// `max_body_size`; we are counting down the uncaptured tail bytes without
+    /// buffering them so that the connection continues to be proxied normally.
+    DrainBody { bytes_remaining: usize },
+}
+
 struct TeeReader<R> {
     inner: R,
     capture: Capture,
     tunnel_name: String,
+    connection_id: String,
     direction: String,
-    buffer: Vec<u8>,
+    /// Maximum body bytes to store, from `config.capture.max_request_body_size`.
+    max_body_size: usize,
+    /// Scratch buffer used only in `FindingHeaders` and `CollectingBody`.
+    /// Cleared when entering `DrainBody` to release memory promptly.
+    buf: Vec<u8>,
+    state: TeeReaderState,
+    /// Set to `true` once a WebSocket upgrade handshake is detected on this
+    /// connection.  Before the upgrade, bytes are only ever interpreted as HTTP.
+    /// After the upgrade, bytes are only ever interpreted as WebSocket frames.
+    websocket_upgraded: bool,
 }
 
 impl<R> TeeReader<R> {
-    fn new(reader: R, capture: Capture, tunnel_name: String, direction: String) -> Self {
+    fn new(
+        reader: R,
+        capture: Capture,
+        tunnel_name: String,
+        connection_id: String,
+        direction: String,
+        max_body_size: usize,
+    ) -> Self {
         Self {
             inner: reader,
             capture,
             tunnel_name,
+            connection_id,
             direction,
-            buffer: Vec::new(),
+            max_body_size,
+            buf: Vec::new(),
+            state: TeeReaderState::FindingHeaders { scan_pos: 0 },
+            websocket_upgraded: false,
         }
     }
 }
@@ -42,18 +96,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for TeeReader<R> {
             Poll::Ready(Ok(())) => {
                 let new_data = &buf.filled()[filled_len..];
                 if !new_data.is_empty() {
-                    // Capture the data for analysis
-                    this.buffer.extend_from_slice(new_data);
-
-                    // Try to parse and capture complete messages from buffer
-                    if let Err(e) = Self::process_buffer(
-                        &this.capture,
-                        &this.tunnel_name,
-                        &this.direction,
-                        &mut this.buffer,
-                    ) {
-                        debug!("Failed to process buffer: {}", e);
-                    }
+                    // Capture side-channel: does not affect forwarded bytes.
+                    this.advance_state(new_data);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -64,102 +108,250 @@ impl<R: AsyncRead + Unpin> AsyncRead for TeeReader<R> {
 }
 
 impl<R: AsyncRead + Unpin> TeeReader<R> {
-    fn process_buffer(
-        capture: &Capture,
-        tunnel_name: &str,
-        direction: &str,
-        buffer: &mut Vec<u8>,
-    ) -> anyhow::Result<()> {
-        // Try to detect and extract HTTP requests/responses
-        while let Some((message, consumed)) = Self::try_extract_http_message(buffer)? {
-            // Store the captured message
-            tokio::spawn({
-                let capture = capture.clone();
-                let tunnel_name = tunnel_name.to_string();
-                let direction = direction.to_string();
-                let message = message.clone();
-                async move {
-                    if let Err(e) = capture
-                        .capture_raw_message(&tunnel_name, &direction, &message)
-                        .await
-                    {
-                        debug!("Failed to capture raw message: {}", e);
+    /// Advance the capture state machine with the bytes that were just read.
+    ///
+    /// All bytes have already been placed in the `ReadBuf` by `poll_read` and
+    /// will be forwarded to `tokio::io::copy` regardless of what happens here.
+    fn advance_state(&mut self, new_data: &[u8]) {
+        // `remaining` tracks the portion of `new_data` not yet consumed by the
+        // current state.  In `FindingHeaders`/`CollectingBody` the bytes are
+        // appended to `self.buf` and `remaining` is reset to an empty slice.
+        // In `DrainBody` the bytes are counted without allocation.
+        let mut remaining = new_data;
+
+        loop {
+            match self.state {
+                // ── Finding HTTP header terminator ────────────────────────
+                TeeReaderState::FindingHeaders { scan_pos } => {
+                    self.buf.extend_from_slice(remaining);
+                    remaining = b"";
+
+                    if self.websocket_upgraded {
+                        // Post-upgrade: the stream carries WebSocket frames only.
+                        while let Ok(Some((frame, consumed))) =
+                            Self::try_extract_websocket_frame(&self.buf)
+                        {
+                            self.dispatch_websocket_frame(frame);
+                            self.buf.drain(0..consumed);
+                        }
+                        self.state = TeeReaderState::FindingHeaders {
+                            scan_pos: self.buf.len().saturating_sub(3),
+                        };
+                        break;
+                    }
+
+                    // Pre-upgrade: the stream carries HTTP messages only.
+                    // If the buffer starts with non-HTTP bytes (e.g. stale bytes
+                    // left from a previous message), skip forward to the next HTTP
+                    // start so that the following request is not missed.
+                    let effective_scan_pos = if Self::starts_with_http(&self.buf) {
+                        scan_pos
+                    } else if let Some(pos) = Self::find_http_start(&self.buf) {
+                        self.buf.drain(0..pos);
+                        0 // rescan from new start
+                    } else {
+                        // No HTTP data yet – wait for more bytes.
+                        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                        break;
+                    };
+
+                    // Scan for \r\n\r\n starting at `effective_scan_pos` (overlap
+                    // by 3 bytes so the delimiter is caught when it spans reads).
+                    let search_from = effective_scan_pos.saturating_sub(3);
+                    let found = self.buf[search_from..]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n");
+
+                    match found {
+                        None => {
+                            self.state = TeeReaderState::FindingHeaders {
+                                scan_pos: self.buf.len().saturating_sub(3),
+                            };
+                            break;
+                        }
+                        Some(rel_pos) => {
+                            let header_end = search_from + rel_pos + 4;
+                            let content_length =
+                                Self::extract_content_length(&self.buf[..header_end]).unwrap_or(0);
+                            let capture_limit = content_length.min(self.max_body_size);
+                            self.state = TeeReaderState::CollectingBody {
+                                header_end,
+                                content_length,
+                                capture_limit,
+                            };
+                            // Fall through to CollectingBody on the next
+                            // iteration – the buffer may already hold enough
+                            // body bytes to dispatch immediately.
+                        }
                     }
                 }
-            });
 
-            // Remove consumed data from buffer
-            buffer.drain(0..consumed);
-        }
+                // ── Collecting body bytes up to capture_limit ─────────────
+                TeeReaderState::CollectingBody {
+                    header_end,
+                    content_length,
+                    capture_limit,
+                } => {
+                    self.buf.extend_from_slice(remaining);
+                    remaining = b"";
 
-        // Also try WebSocket frame detection
-        while let Some((message, consumed)) = Self::try_extract_websocket_frame(buffer)? {
-            tokio::spawn({
-                let capture = capture.clone();
-                let tunnel_name = tunnel_name.to_string();
-                let direction = direction.to_string();
-                let message = message.clone();
-                async move {
-                    if let Err(e) = capture
-                        .capture_websocket_message_raw(&tunnel_name, &direction, &message)
-                        .await
-                    {
-                        debug!("Failed to capture WebSocket frame: {}", e);
+                    let body_in_buf = self.buf.len().saturating_sub(header_end);
+
+                    if content_length == 0 {
+                        // No body (or unknown length): capture headers only.
+                        let headers = &self.buf[..header_end];
+                        self.dispatch_http_message(headers.to_vec());
+                        // Detect WebSocket upgrade so future bytes are parsed as
+                        // frames rather than HTTP.  The upgrade request (client →
+                        // server) and the 101 response (server → client) are each
+                        // seen by their respective TeeReader, so both independently
+                        // set this flag at the right moment.
+                        if Self::is_websocket_upgrade_headers(headers)
+                            || Self::is_101_switching_protocols(headers)
+                        {
+                            self.websocket_upgraded = true;
+                        }
+                        self.buf.drain(0..header_end);
+                        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                        // Loop: the buffer may contain the next message.
+                    } else if body_in_buf < capture_limit {
+                        // Still waiting for more body bytes.
+                        break;
+                    } else {
+                        // Enough body to dispatch.
+                        let capture_end = header_end + capture_limit;
+                        self.dispatch_http_message(self.buf[..capture_end].to_vec());
+
+                        let total_message = header_end + content_length;
+                        if self.buf.len() >= total_message {
+                            // Full message already in buffer; drain and continue.
+                            self.buf.drain(0..total_message);
+                            self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                            // Loop: leftover bytes may start the next message.
+                        } else {
+                            // Body tail not yet received; switch to drain mode.
+                            let bytes_remaining = total_message - self.buf.len();
+                            self.buf.clear(); // Release memory – no longer needed.
+                            self.state = TeeReaderState::DrainBody { bytes_remaining };
+                            break;
+                        }
                     }
                 }
-            });
 
-            buffer.drain(0..consumed);
-        }
+                // ── Counting remaining body bytes without buffering ────────
+                TeeReaderState::DrainBody { bytes_remaining } => {
+                    let consumed = remaining.len().min(bytes_remaining);
+                    remaining = &remaining[consumed..];
+                    let new_remaining = bytes_remaining - consumed;
 
-        Ok(())
-    }
-
-    fn try_extract_http_message(buffer: &[u8]) -> anyhow::Result<Option<(Vec<u8>, usize)>> {
-        // Look for HTTP request/response pattern
-        if buffer.len() < 4 {
-            return Ok(None);
-        }
-
-        // Convert to string for pattern matching
-        let buffer_str = String::from_utf8_lossy(buffer);
-
-        // Check if this looks like HTTP (starts with GET/POST/PUT/DELETE/etc or HTTP/1.x)
-        let is_http = buffer_str
-            .lines()
-            .next()
-            .map(|line| {
-                line.starts_with("GET")
-                    || line.starts_with("POST")
-                    || line.starts_with("PUT")
-                    || line.starts_with("DELETE")
-                    || line.starts_with("HEAD")
-                    || line.starts_with("OPTIONS")
-                    || line.starts_with("PATCH")
-                    || line.starts_with("HTTP/")
-            })
-            .unwrap_or(false);
-
-        if !is_http {
-            return Ok(None);
-        }
-
-        // Find the end of headers (\r\n\r\n)
-        if let Some(header_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            let header_end = header_end + 4;
-
-            // Try to determine content length
-            let content_length = Self::extract_content_length(&buffer[..header_end]).unwrap_or(0);
-
-            let total_length = header_end + content_length;
-
-            // If we have the complete message, extract it
-            if buffer.len() >= total_length {
-                return Ok(Some((buffer[..total_length].to_vec(), total_length)));
+                    if new_remaining == 0 {
+                        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                        // Loop: leftover bytes in `remaining` start the next message.
+                    } else {
+                        self.state = TeeReaderState::DrainBody {
+                            bytes_remaining: new_remaining,
+                        };
+                        break;
+                    }
+                }
             }
         }
+    }
 
-        Ok(None)
+    fn dispatch_http_message(&self, message: Vec<u8>) {
+        tokio::spawn({
+            let capture = self.capture.clone();
+            let tunnel_name = self.tunnel_name.clone();
+            let connection_id = self.connection_id.clone();
+            let direction = self.direction.clone();
+            async move {
+                if let Err(e) = capture
+                    .capture_raw_message(&tunnel_name, &connection_id, &direction, &message)
+                    .await
+                {
+                    debug!("Failed to capture HTTP message: {}", e);
+                }
+            }
+        });
+    }
+
+    fn dispatch_websocket_frame(&self, frame: Vec<u8>) {
+        tokio::spawn({
+            let capture = self.capture.clone();
+            let tunnel_name = self.tunnel_name.clone();
+            let connection_id = self.connection_id.clone();
+            let direction = self.direction.clone();
+            async move {
+                if let Err(e) = capture
+                    .capture_websocket_message_raw(&tunnel_name, &connection_id, &direction, &frame)
+                    .await
+                {
+                    debug!("Failed to capture WebSocket frame: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Returns `true` if `buf` starts with an HTTP method token or `HTTP/`.
+    fn starts_with_http(buf: &[u8]) -> bool {
+        let first_line = String::from_utf8_lossy(buf)
+            .lines()
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        crate::capture::is_http_request_line(&first_line) || first_line.starts_with("HTTP/")
+    }
+
+    /// Scans `buf` for the first byte position where an HTTP request line or
+    /// response line starts.  Returns `None` when no such position exists.
+    ///
+    /// Used to skip stale non-HTTP bytes that may precede the next HTTP message
+    /// (e.g. residual bytes from a previous message with unknown body length).
+    fn find_http_start(buf: &[u8]) -> Option<usize> {
+        const PREFIXES: &[&[u8]] = &[
+            b"GET ",
+            b"POST ",
+            b"PUT ",
+            b"DELETE ",
+            b"HEAD ",
+            b"OPTIONS ",
+            b"PATCH ",
+            b"HTTP/",
+        ];
+        for i in 0..buf.len() {
+            for prefix in PREFIXES {
+                if buf[i..].starts_with(prefix) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns `true` if `headers` contain both `Upgrade: websocket` and
+    /// `Connection: … upgrade …` (case-insensitive), indicating a WebSocket
+    /// upgrade request.
+    fn is_websocket_upgrade_headers(headers: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(headers);
+        let has_upgrade = text.lines().any(|l| {
+            let lower = l.to_lowercase();
+            lower.starts_with("upgrade:") && lower.contains("websocket")
+        });
+        let has_connection = text.lines().any(|l| {
+            let lower = l.to_lowercase();
+            lower.starts_with("connection:") && lower.contains("upgrade")
+        });
+        has_upgrade && has_connection
+    }
+
+    /// Returns `true` if `headers` is an HTTP 101 Switching Protocols response.
+    fn is_101_switching_protocols(headers: &[u8]) -> bool {
+        String::from_utf8_lossy(headers)
+            .lines()
+            .next()
+            .and_then(|l| l.split(' ').nth(1))
+            .map(|code| code == "101")
+            .unwrap_or(false)
     }
 
     fn try_extract_websocket_frame(buffer: &[u8]) -> anyhow::Result<Option<(Vec<u8>, usize)>> {
@@ -171,11 +363,11 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
         let first_byte = buffer[0];
         let second_byte = buffer[1];
 
-        // Check for WebSocket frame: first bit should be 0-3 (opcode), second bit should have mask bit
         let opcode = first_byte & 0x0F;
         let masked = (second_byte & 0x80) != 0;
 
-        // Valid opcodes: 0x0 (continuation), 0x1 (text), 0x2 (binary), 0x8 (close), 0x9 (ping), 0xA (pong)
+        // Valid opcodes: 0x0 (continuation), 0x1 (text), 0x2 (binary),
+        //               0x8 (close), 0x9 (ping), 0xA (pong)
         let valid_opcode = matches!(opcode, 0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xA);
 
         if !valid_opcode {
@@ -185,14 +377,12 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
         let payload_len = (second_byte & 0x7F) as usize;
         let mut header_len = 2;
 
-        // Extended payload length
         if payload_len == 126 {
             header_len += 2;
         } else if payload_len == 127 {
             header_len += 8;
         }
 
-        // Masking key (if present)
         if masked {
             header_len += 4;
         }
@@ -210,7 +400,7 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
         let data_str = String::from_utf8_lossy(data);
         for line in data_str.lines() {
             if line.to_lowercase().starts_with("content-length:") {
-                let parts: Vec<&str> = line.split(':').collect();
+                let parts: Vec<&str> = line.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     return parts[1].trim().parse().ok();
                 }
@@ -220,23 +410,44 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
     }
 }
 
+/// Listens on a Unix domain socket and forwards each connection to a local TCP
+/// port, capturing HTTP and WebSocket traffic in both directions.
 pub struct Proxy {
     config: TunnelConfig,
     capture: Capture,
+    max_body_size: usize,
 }
 
 impl Proxy {
-    pub fn new(config: TunnelConfig, max_stored_requests: usize, stdout_level: &str) -> Self {
+    /// Creates a new `Proxy` for the tunnel described by `config`.
+    ///
+    /// * `max_body_size` — bodies larger than this are truncated before storage.
+    /// * `log_body_limit` — bodies larger than this are truncated before logging.
+    pub fn new(
+        config: TunnelConfig,
+        request_storage: Arc<crate::storage::RequestStorage>,
+        websocket_storage: Arc<crate::storage::WebSocketMessageStorage>,
+        stdout_level: &str,
+        max_body_size: usize,
+        log_body_limit: usize,
+    ) -> Self {
         Self {
-            capture: Capture::new(max_stored_requests, stdout_level),
+            capture: Capture::new(
+                (*request_storage).clone(),
+                (*websocket_storage).clone(),
+                stdout_level,
+                log_body_limit,
+            ),
             config,
+            max_body_size,
         }
     }
 
+    /// Binds to the Unix socket path in `config`, accepts connections in a loop,
+    /// and stops when `cancel_token` is cancelled.
     pub async fn start(&self, cancel_token: CancellationToken) -> anyhow::Result<()> {
         let socket_path = &self.config.socket_path;
 
-        // Remove existing socket file if it exists
         if Path::new(socket_path).exists() {
             std::fs::remove_file(socket_path)?;
         }
@@ -251,9 +462,13 @@ impl Proxy {
                         Ok((stream, _)) => {
                             let config = self.config.clone();
                             let capture = self.capture.clone();
+                            let max_body_size = self.max_body_size;
 
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, config, capture).await {
+                                if let Err(e) =
+                                    Self::handle_connection(stream, config, capture, max_body_size)
+                                        .await
+                                {
                                     error!("Connection error: {}", e);
                                 }
                             });
@@ -270,7 +485,6 @@ impl Proxy {
             }
         }
 
-        // Clean up socket file
         if Path::new(socket_path).exists() {
             std::fs::remove_file(socket_path)?;
         }
@@ -282,8 +496,8 @@ impl Proxy {
         unix_stream: UnixStream,
         config: TunnelConfig,
         capture: Capture,
+        max_body_size: usize,
     ) -> anyhow::Result<()> {
-        // Connect to target TCP port
         let target_addr = format!("127.0.0.1:{}", config.target_port);
         let tcp_stream = match TcpStream::connect(&target_addr).await {
             Ok(stream) => stream,
@@ -298,26 +512,29 @@ impl Proxy {
             config.name, target_addr
         );
 
-        // Split streams for bidirectional forwarding
         let (unix_reader, unix_writer) = unix_stream.into_split();
         let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
-        // Create tee readers for capturing data
+        let connection_id = format!("{}-{}", config.name, uuid::Uuid::new_v4());
+
         let client_to_server_tee = TeeReader::new(
             unix_reader,
             capture.clone(),
             config.name.clone(),
+            connection_id.clone(),
             "→".to_string(),
+            max_body_size,
         );
 
         let server_to_client_tee = TeeReader::new(
             tcp_reader,
             capture.clone(),
             config.name.clone(),
+            connection_id,
             "←".to_string(),
+            max_body_size,
         );
 
-        // Perform bidirectional forwarding using spawned tasks
         let (bytes_sent, bytes_received) = tokio::join!(
             async {
                 let mut client_reader = client_to_server_tee;
@@ -351,16 +568,30 @@ impl Proxy {
 mod tests {
     use super::*;
     use std::io;
+    use tokio::io::AsyncReadExt;
 
-    // Mock AsyncRead for testing
     struct MockReader {
         data: Vec<u8>,
         position: usize,
+        /// If set, return at most this many bytes per poll.
+        chunk_size: Option<usize>,
     }
 
     impl MockReader {
         fn new(data: Vec<u8>) -> Self {
-            Self { data, position: 0 }
+            Self {
+                data,
+                position: 0,
+                chunk_size: None,
+            }
+        }
+
+        fn with_chunk_size(data: Vec<u8>, chunk_size: usize) -> Self {
+            Self {
+                data,
+                position: 0,
+                chunk_size: Some(chunk_size),
+            }
         }
     }
 
@@ -375,7 +606,10 @@ mod tests {
             }
 
             let remaining = self.data.len() - self.position;
-            let to_copy = std::cmp::min(remaining, buf.remaining());
+            let to_copy = match self.chunk_size {
+                Some(max) => remaining.min(max).min(buf.remaining()),
+                None => remaining.min(buf.remaining()),
+            };
 
             let end_pos = self.position + to_copy;
             buf.put_slice(&self.data[self.position..end_pos]);
@@ -385,90 +619,448 @@ mod tests {
         }
     }
 
+    fn make_capture() -> (Capture, Arc<crate::storage::RequestStorage>) {
+        let storage = Arc::new(crate::storage::RequestStorage::new(100));
+        let websocket_storage = Arc::new(crate::storage::WebSocketMessageStorage::new(1000));
+        let capture = Capture::new(
+            (*storage).clone(),
+            (*websocket_storage).clone(),
+            "debug",
+            1024,
+        );
+        (capture, storage)
+    }
+
+    fn make_tee_reader(data: Vec<u8>, max_body_size: usize) -> TeeReader<MockReader> {
+        let (capture, _) = make_capture();
+        TeeReader::new(
+            MockReader::new(data),
+            capture,
+            "test".to_string(),
+            "test-connection".to_string(),
+            "→".to_string(),
+            max_body_size,
+        )
+    }
+
+    fn make_tee_reader_chunked(
+        data: Vec<u8>,
+        max_body_size: usize,
+        chunk_size: usize,
+    ) -> TeeReader<MockReader> {
+        let (capture, _) = make_capture();
+        TeeReader::new(
+            MockReader::with_chunk_size(data, chunk_size),
+            capture,
+            "test".to_string(),
+            "test-connection".to_string(),
+            "→".to_string(),
+            max_body_size,
+        )
+    }
+
+    /// Drive a TeeReader to completion and return all forwarded bytes.
+    async fn read_all(reader: &mut TeeReader<MockReader>) -> Vec<u8> {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.unwrap();
+        output
+    }
+
+    // ── TeeReader construction ────────────────────────────────────────────
+
     #[tokio::test]
     async fn test_tee_reader_creation() {
-        let mock_reader = MockReader::new(vec![1, 2, 3]);
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel".to_string();
-        let direction = "→".to_string();
-
-        let tee_reader = TeeReader::new(mock_reader, capture, tunnel_name, direction);
+        let (capture, _) = make_capture();
+        let tee_reader = TeeReader::new(
+            MockReader::new(vec![1, 2, 3]),
+            capture,
+            "test_tunnel".to_string(),
+            "test-connection".to_string(),
+            "→".to_string(),
+            65536,
+        );
 
         assert_eq!(tee_reader.tunnel_name, "test_tunnel");
         assert_eq!(tee_reader.direction, "→");
-        assert!(tee_reader.buffer.is_empty());
+        assert_eq!(tee_reader.max_body_size, 65536);
+        assert!(tee_reader.buf.is_empty());
+        assert!(matches!(
+            tee_reader.state,
+            TeeReaderState::FindingHeaders { scan_pos: 0 }
+        ));
     }
 
     #[tokio::test]
     async fn test_tee_reader_basic_reading() {
         let data = b"Hello, World!".to_vec();
-        let mock_reader = MockReader::new(data.clone());
-        let capture = Capture::new(100, "debug");
-        let tee_reader = TeeReader::new(mock_reader, capture, "test".to_string(), "→".to_string());
+        let mut tee_reader = make_tee_reader(data.clone(), 65536);
+        let output = read_all(&mut tee_reader).await;
+        // All bytes must be forwarded regardless of whether they are HTTP.
+        assert_eq!(output, data);
+    }
 
-        // Test that the TeeReader can be created and has the expected fields
-        assert_eq!(tee_reader.tunnel_name, "test");
-        assert_eq!(tee_reader.direction, "→");
-        assert!(tee_reader.buffer.is_empty());
+    // ── Forwarding correctness ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_all_bytes_forwarded_small_body() {
+        let body = b"Hello";
+        let msg = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let mut reader = make_tee_reader(msg.as_bytes().to_vec(), 65536);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, msg.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_all_bytes_forwarded_large_body() {
+        // Body exceeds max_body_size – all bytes must still be forwarded.
+        let body = vec![0xAB_u8; 2 * 1024 * 1024]; // 2 MB
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let mut data = header.as_bytes().to_vec();
+        data.extend_from_slice(&body);
+        let total_len = data.len();
+
+        let mut reader = make_tee_reader(data, 64 * 1024); // 64 KB cap
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded.len(), total_len);
+    }
+
+    // ── State machine: body size limiting ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_body_below_limit_state() {
+        // After reading a complete short response the state machine should have
+        // reset to FindingHeaders (ready for the next message).
+        let body = b"Hello";
+        let msg = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let mut reader = make_tee_reader(msg.as_bytes().to_vec(), 65536);
+        read_all(&mut reader).await;
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_body_at_limit_state() {
+        let body = vec![b'X'; 100];
+        let msg_bytes = {
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            let mut v = header.as_bytes().to_vec();
+            v.extend_from_slice(&body);
+            v
+        };
+        let mut reader = make_tee_reader(msg_bytes, 100);
+        read_all(&mut reader).await;
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_body_exceeds_limit_state() {
+        // Body is larger than max_body_size; after fully reading the connection
+        // the state machine should have reset to FindingHeaders.
+        let body = vec![b'Z'; 500];
+        let msg_bytes = {
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n");
+            let mut v = header.as_bytes().to_vec();
+            v.extend_from_slice(&body);
+            v
+        };
+        let mut reader = make_tee_reader(msg_bytes, 100); // cap at 100 bytes
+        read_all(&mut reader).await;
+        // All body bytes drained; state reset.
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_buf_capped_at_max_body_size_during_drain() {
+        // While draining the body tail the buf should have been cleared.
+        let body = vec![b'Y'; 1000];
+        let _ = {
+            let header = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+            let mut v = header.as_bytes().to_vec();
+            v.extend_from_slice(&body);
+            v
+        };
+        // Use a chunked reader so we can inspect intermediate state.
+        let cap = 200_usize;
+        // Feed header + cap bytes → should dispatch capture and enter DrainBody.
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+        let partial: Vec<u8> = header
+            .iter()
+            .chain(vec![b'Y'; cap].iter())
+            .copied()
+            .collect();
+
+        let (capture, _) = make_capture();
+        let mut reader = TeeReader::new(
+            MockReader::new(partial.clone()),
+            capture,
+            "test".to_string(),
+            "conn".to_string(),
+            "→".to_string(),
+            cap,
+        );
+        read_all(&mut reader).await;
+
+        // After reading header + exactly cap body bytes, capture dispatched and
+        // state should be DrainBody (800 more bytes expected).
+        match reader.state {
+            TeeReaderState::DrainBody { bytes_remaining } => {
+                assert_eq!(bytes_remaining, 1000 - cap);
+            }
+            other => panic!("Expected DrainBody, got {:?}", other),
+        }
+        // buf must be empty – no accumulation during drain.
+        assert!(reader.buf.is_empty());
+    }
+
+    // ── State machine: pipelined messages ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_pipelined_http_requests() {
+        // Two complete requests in one buffer; both should be captured and the
+        // state machine should reset cleanly after each.
+        let req1 = b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let req2 = b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut data = req1.to_vec();
+        data.extend_from_slice(req2);
+
+        let mut reader = make_tee_reader(data.clone(), 65536);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, data);
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipelined_requests_with_bodies() {
+        let req1 = b"POST /a HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
+        let req2 = b"POST /b HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        let mut data = req1.to_vec();
+        data.extend_from_slice(req2);
+
+        let mut reader = make_tee_reader(data.clone(), 65536);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, data);
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    // ── State machine: multi-read scenarios ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_header_delimiter_split_across_reads() {
+        // The \r\n\r\n delimiter is split: first chunk ends with \r\n\r,
+        // second chunk starts with \n.  scan_pos overlap must catch this.
+        let msg = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        // Split just before the last \n of the double-CRLF.
+        // The header terminator spans: ...r\r\n\r  |  \nhello
+        // Find \r\n\r\n manually
+        let delim_pos = msg
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("should contain \\r\\n\\r\\n");
+        let split = delim_pos + 3; // split in the middle of \r\n\r\n
+
+        let part1 = &msg[..split];
+        let part2 = &msg[split..];
+
+        // Build a reader that delivers part1 then part2 in separate poll_reads.
+        let mut combined = part1.to_vec();
+        combined.extend_from_slice(part2);
+
+        let mut reader = make_tee_reader_chunked(combined.clone(), 65536, split);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, msg as &[u8]);
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_large_body_multiple_reads_all_forwarded() {
+        let body = vec![0xCD_u8; 10_000];
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n");
+        let mut data = header.as_bytes().to_vec();
+        data.extend_from_slice(&body);
+        let total_len = data.len();
+
+        // 128-byte chunks
+        let mut reader = make_tee_reader_chunked(data, 500, 128);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded.len(), total_len);
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_incremental_scan_pos_no_rescan() {
+        // Verify that scan_pos advances and we don't re-scan old bytes.
+        // We feed a long header (no body) one byte at a time.
+        let msg = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut reader = make_tee_reader_chunked(msg.to_vec(), 65536, 1);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, msg as &[u8]);
+        // scan_pos should have advanced close to the end (or reset after capture).
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+    }
+
+    // ── No Content-Length ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_no_content_length_captures_headers_only() {
+        let msg = b"HTTP/1.1 204 No Content\r\nDate: Mon, 01 Jan 2024\r\n\r\n";
+        let mut reader = make_tee_reader(msg.to_vec(), 65536);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, msg as &[u8]);
+        assert!(matches!(
+            reader.state,
+            TeeReaderState::FindingHeaders { .. }
+        ));
+        assert!(reader.buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_all_http_methods() {
+        let methods = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"];
+        for method in methods {
+            let msg = format!("{} / HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
+            let mut reader = make_tee_reader(msg.as_bytes().to_vec(), 65536);
+            let forwarded = read_all(&mut reader).await;
+            assert_eq!(
+                forwarded,
+                msg.as_bytes(),
+                "All bytes should be forwarded for {}",
+                method
+            );
+        }
+    }
+
+    // ── starts_with_http helper ───────────────────────────────────────────
+
+    #[test]
+    fn test_starts_with_http_request_methods() {
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"GET / HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"POST /x HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"PUT /y HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"DELETE /z HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"HEAD / HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"OPTIONS * HTTP/1.1\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"PATCH /p HTTP/1.1\r\n"
+        ));
     }
 
     #[test]
-    fn test_extract_http_request() {
-        let http_request = b"GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
-        let result = TeeReader::<MockReader>::try_extract_http_message(http_request).unwrap();
-
-        assert!(result.is_some());
-        let (extracted, consumed) = result.unwrap();
-        assert_eq!(extracted, http_request);
-        assert_eq!(consumed, http_request.len());
+    fn test_starts_with_http_response() {
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"HTTP/1.1 200 OK\r\n"
+        ));
+        assert!(TeeReader::<MockReader>::starts_with_http(
+            b"HTTP/1.0 404 Not Found\r\n"
+        ));
     }
 
     #[test]
-    fn test_extract_http_response() {
-        let http_response =
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nHello";
-        let result = TeeReader::<MockReader>::try_extract_http_message(http_response).unwrap();
-
-        assert!(result.is_some());
-        let (extracted, consumed) = result.unwrap();
-        assert_eq!(extracted, http_response);
-        assert_eq!(consumed, http_response.len());
+    fn test_starts_with_http_websocket_frame() {
+        // A WebSocket frame should NOT be identified as HTTP.
+        let ws_frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
+        assert!(!TeeReader::<MockReader>::starts_with_http(ws_frame));
     }
 
     #[test]
-    fn test_extract_http_with_body() {
-        let http_message =
-            b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 12\r\n\r\nHello World!";
-        let result = TeeReader::<MockReader>::try_extract_http_message(http_message).unwrap();
+    fn test_starts_with_http_empty() {
+        assert!(!TeeReader::<MockReader>::starts_with_http(b""));
+    }
 
-        assert!(result.is_some());
-        let (extracted, consumed) = result.unwrap();
-        assert_eq!(extracted, http_message);
-        assert_eq!(consumed, http_message.len());
+    // ── extract_content_length ───────────────────────────────────────────
+
+    #[test]
+    fn test_extract_content_length() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(
+            TeeReader::<MockReader>::extract_content_length(data),
+            Some(42)
+        );
     }
 
     #[test]
-    fn test_extract_http_incomplete() {
-        let incomplete_http = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
-        let result = TeeReader::<MockReader>::try_extract_http_message(incomplete_http).unwrap();
-
-        assert!(result.is_none());
+    fn test_extract_content_length_case_insensitive() {
+        let data = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n";
+        assert_eq!(
+            TeeReader::<MockReader>::extract_content_length(data),
+            Some(100)
+        );
     }
 
     #[test]
-    fn test_extract_http_non_http() {
-        let non_http = b"Random data that is not HTTP";
-        let result = TeeReader::<MockReader>::try_extract_http_message(non_http).unwrap();
-
-        assert!(result.is_none());
+    fn test_extract_content_length_no_header() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+        assert_eq!(TeeReader::<MockReader>::extract_content_length(data), None);
     }
+
+    #[test]
+    fn test_extract_content_length_invalid_format() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n";
+        assert_eq!(TeeReader::<MockReader>::extract_content_length(data), None);
+    }
+
+    #[test]
+    fn test_extract_content_length_with_spaces() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Length:   25   \r\n\r\n";
+        assert_eq!(
+            TeeReader::<MockReader>::extract_content_length(data),
+            Some(25)
+        );
+    }
+
+    // ── WebSocket frame extraction ────────────────────────────────────────
 
     #[test]
     fn test_extract_websocket_text_frame() {
-        // WebSocket text frame: FIN=1, opcode=1, masked=1, payload_len=5
-        let frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"; // "Hello" masked
+        let frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -477,10 +1069,8 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_binary_frame() {
-        // WebSocket binary frame: FIN=1, opcode=2, masked=1, payload_len=3
-        let frame = b"\x82\x83\x12\x34\x56\x78\x9a\xbc\xde"; // Binary data masked (3 bytes + 4 byte mask)
+        let frame = b"\x82\x83\x12\x34\x56\x78\x9a\xbc\xde";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -489,10 +1079,8 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_close_frame() {
-        // WebSocket close frame: FIN=1, opcode=8, masked=1, payload_len=2
-        let frame = b"\x88\x82\x12\x34\x56\x78\x9a\xbc"; // Close code masked (2 bytes + 4 byte mask)
+        let frame = b"\x88\x82\x12\x34\x56\x78\x9a\xbc";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -501,10 +1089,8 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_ping_frame() {
-        // WebSocket ping frame: FIN=1, opcode=9, masked=1, payload_len=4
-        let frame = b"\x89\x84\x12\x34\x56\x78\x9a\xbc\xde\xf0"; // Ping data masked (4 bytes + 4 byte mask)
+        let frame = b"\x89\x84\x12\x34\x56\x78\x9a\xbc\xde\xf0";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -513,10 +1099,8 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_pong_frame() {
-        // WebSocket pong frame: FIN=1, opcode=10, masked=1, payload_len=4
-        let frame = b"\x8a\x84\x12\x34\x56\x78\x9a\xbc\xde\xf0"; // Pong data masked (4 bytes + 4 byte mask)
+        let frame = b"\x8a\x84\x12\x34\x56\x78\x9a\xbc\xde\xf0";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -525,14 +1109,11 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_extended_payload() {
-        // WebSocket frame with extended payload length (126) - unmasked for simplicity
         let mut frame = Vec::new();
-        frame.extend_from_slice(&[0x82, 0x7e]); // FIN=1, opcode=2, masked=0, payload_len=126
-        frame.extend_from_slice(&[0x00, 0x7e]); // Extended payload length: 126
-        frame.extend_from_slice(&[0u8; 126]); // Payload
-
+        frame.extend_from_slice(&[0x82, 0x7e]);
+        frame.extend_from_slice(&[0x00, 0x7e]);
+        frame.extend_from_slice(&[0u8; 126]);
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(&frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -541,193 +1122,30 @@ mod tests {
 
     #[test]
     fn test_extract_websocket_incomplete() {
-        let incomplete_frame = b"\x81\x85"; // Only header, no payload
+        let incomplete_frame = b"\x81\x85";
         let result =
             TeeReader::<MockReader>::try_extract_websocket_frame(incomplete_frame).unwrap();
-
         assert!(result.is_none());
     }
 
     #[test]
     fn test_extract_websocket_invalid_opcode() {
-        // Invalid opcode (0x3 is reserved)
         let frame = b"\x83\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_none());
     }
 
     #[test]
     fn test_extract_websocket_too_short() {
-        let too_short = b"\x81"; // Only 1 byte
+        let too_short = b"\x81";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(too_short).unwrap();
-
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_extract_content_length() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\n\r\n";
-        let result = TeeReader::<MockReader>::extract_content_length(data);
-
-        assert_eq!(result, Some(42));
-    }
-
-    #[test]
-    fn test_extract_content_length_case_insensitive() {
-        let data = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n";
-        let result = TeeReader::<MockReader>::extract_content_length(data);
-
-        assert_eq!(result, Some(100));
-    }
-
-    #[test]
-    fn test_extract_content_length_no_header() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
-        let result = TeeReader::<MockReader>::extract_content_length(data);
-
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_content_length_invalid_format() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n";
-        let result = TeeReader::<MockReader>::extract_content_length(data);
-
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_content_length_with_spaces() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Length:   25   \r\n\r\n";
-        let result = TeeReader::<MockReader>::extract_content_length(data);
-
-        assert_eq!(result, Some(25));
-    }
-
-    #[tokio::test]
-    async fn test_process_buffer_with_http() {
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel";
-        let direction = "→";
-        let http_data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let mut buffer = http_data.to_vec();
-
-        // This should not panic and should process the HTTP message
-        let result =
-            TeeReader::<MockReader>::process_buffer(&capture, tunnel_name, direction, &mut buffer);
-
-        assert!(result.is_ok());
-        // Buffer should be empty after processing
-        assert!(buffer.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_process_buffer_with_websocket() {
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel";
-        let direction = "←";
-        let ws_frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"; // "Hello" masked
-        let mut buffer = ws_frame.to_vec();
-
-        let result =
-            TeeReader::<MockReader>::process_buffer(&capture, tunnel_name, direction, &mut buffer);
-
-        assert!(result.is_ok());
-        // Buffer should be empty after processing
-        assert!(buffer.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_process_buffer_with_mixed_data() {
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel";
-        let direction = "→";
-
-        // Mix HTTP request and WebSocket frame
-        let http_data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let ws_frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
-        let mut buffer = Vec::new();
-        buffer.extend_from_slice(http_data);
-        buffer.extend_from_slice(ws_frame);
-
-        let result =
-            TeeReader::<MockReader>::process_buffer(&capture, tunnel_name, direction, &mut buffer);
-
-        assert!(result.is_ok());
-        // Buffer should be empty after processing both messages
-        assert!(buffer.is_empty());
-    }
-
-    #[test]
-    fn test_process_buffer_with_incomplete_data() {
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel";
-        let direction = "→";
-        let incomplete_http = b"GET / HTTP/1.1\r\nHost: example.com";
-        let mut buffer = incomplete_http.to_vec();
-
-        let result =
-            TeeReader::<MockReader>::process_buffer(&capture, tunnel_name, direction, &mut buffer);
-
-        assert!(result.is_ok());
-        // Buffer should remain unchanged for incomplete data
-        assert_eq!(buffer, incomplete_http);
-    }
-
-    #[test]
-    fn test_process_buffer_with_non_protocol_data() {
-        let capture = Capture::new(100, "debug");
-        let tunnel_name = "test_tunnel";
-        let direction = "→";
-        let random_data = b"This is just random data that doesn't match any protocol";
-        let mut buffer = random_data.to_vec();
-
-        let result =
-            TeeReader::<MockReader>::process_buffer(&capture, tunnel_name, direction, &mut buffer);
-
-        assert!(result.is_ok());
-        // Buffer should remain unchanged for non-protocol data
-        assert_eq!(buffer, random_data);
-    }
-
-    #[test]
-    fn test_proxy_creation() {
-        let config = TunnelConfig {
-            name: "test_tunnel".to_string(),
-            socket_path: "/tmp/test.sock".to_string(),
-            target_port: 8080,
-        };
-
-        let proxy = Proxy::new(config, 100, "debug");
-
-        assert_eq!(proxy.config.name, "test_tunnel");
-        assert_eq!(proxy.config.target_port, 8080);
-        assert_eq!(proxy.config.socket_path, "/tmp/test.sock");
-    }
-
-    #[test]
-    fn test_all_http_methods() {
-        let methods = ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"];
-
-        for method in methods.iter() {
-            let http_request = format!("{} / HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
-            let result =
-                TeeReader::<MockReader>::try_extract_http_message(http_request.as_bytes()).unwrap();
-
-            assert!(result.is_some(), "Failed to extract {} request", method);
-            let (extracted, consumed) = result.unwrap();
-            assert_eq!(extracted, http_request.as_bytes());
-            assert_eq!(consumed, http_request.len());
-        }
-    }
-
-    #[test]
     fn test_websocket_continuation_frame() {
-        // WebSocket continuation frame: FIN=1, opcode=0x0, masked=1, payload_len=5
-        let frame = b"\x80\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"; // Continuation data masked
+        let frame = b"\x80\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
@@ -736,13 +1154,47 @@ mod tests {
 
     #[test]
     fn test_websocket_unmasked_frame() {
-        // WebSocket frame without masking: FIN=1, opcode=1, masked=0, payload_len=5
         let frame = b"\x81\x05Hello";
         let result = TeeReader::<MockReader>::try_extract_websocket_frame(frame).unwrap();
-
         assert!(result.is_some());
         let (extracted, consumed) = result.unwrap();
         assert_eq!(extracted, frame);
         assert_eq!(consumed, frame.len());
+    }
+
+    // ── WebSocket forwarding ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_websocket_frames_forwarded() {
+        // Two WebSocket frames back-to-back; all bytes must pass through.
+        let frame1 = b"\x81\x05Hello";
+        let frame2 = b"\x82\x03abc";
+        let mut data = frame1.to_vec();
+        data.extend_from_slice(frame2);
+
+        let mut reader = make_tee_reader(data.clone(), 65536);
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, data);
+    }
+
+    // ── Proxy struct ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_proxy_creation() {
+        let config = TunnelConfig {
+            name: "test_tunnel".to_string(),
+            domain: "test.tunnel.example.com".to_string(),
+            socket_path: "/tmp/test.sock".to_string(),
+            target_port: 8080,
+        };
+
+        let storage = Arc::new(crate::storage::RequestStorage::new(100));
+        let websocket_storage = Arc::new(crate::storage::WebSocketMessageStorage::new(1000));
+        let proxy = Proxy::new(config, storage, websocket_storage, "debug", 1_048_576, 1024);
+
+        assert_eq!(proxy.config.name, "test_tunnel");
+        assert_eq!(proxy.config.target_port, 8080);
+        assert_eq!(proxy.config.socket_path, "/tmp/test.sock");
+        assert_eq!(proxy.max_body_size, 1_048_576);
     }
 }
