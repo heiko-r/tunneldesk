@@ -328,7 +328,7 @@ mod tests {
     use super::*;
     use crate::config::{CaptureConfig, Config, GuiConfig, LoggingConfig, TunnelConfig};
     use crate::storage::{
-        RequestStorage, StoredRequest, StoredResponse, StoredWebSocketMessage,
+        RequestStorage, StatusFilter, StoredRequest, StoredResponse, StoredWebSocketMessage,
         WebSocketMessageStorage, WebSocketMessageType,
     };
     use std::collections::HashMap;
@@ -623,7 +623,7 @@ mod tests {
             response: None,
         };
         let filter = QueryFilter {
-            status: Some(200),
+            status: Some(StatusFilter::Exact(200)),
             ..Default::default()
         };
         // No response → must not match when status filter is set.

@@ -1,0 +1,174 @@
+/* ── Reset ── */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* ── Variables ── */
+:root {
+  --bg: #080b0f;
+  --bg1: #0d1117;
+  --bg2: #111820;
+  --bg3: #16212e;
+  --border: #1e2d3d;
+  --border2: #243444;
+  --text: #c8d8c0;
+  --dim: #5a7a6a;
+  --green: #3ddc84;
+  --green2: #2ab56c;
+  --yellow: #f0c040;
+  --red: #e05555;
+  --blue: #4a9fe0;
+  --orange: #e08844;
+  --purple: #9a78e8;
+}
+
+/* ── Base ── */
+body {
+  background: #080b0f;
+  color: #c8d8c0;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Buttons ── */
+.btn-sm {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  color: var(--text);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 5px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.1s;
+}
+.btn-sm:hover {
+  background: var(--bg2);
+  border-color: var(--text);
+}
+.btn-start {
+  color: var(--green);
+  border-color: var(--green2);
+}
+.btn-start:hover {
+  background: var(--green);
+  color: var(--bg);
+}
+.btn-stop {
+  color: var(--red);
+  border-color: var(--red);
+}
+.btn-stop:hover {
+  background: var(--red);
+  color: var(--bg);
+}
+
+/* ── Method badges ── */
+.badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 2px;
+  letter-spacing: 0.05em;
+}
+.method-get {
+  background: rgba(61, 220, 132, 0.12);
+  color: var(--green);
+  border: 1px solid rgba(61, 220, 132, 0.3);
+}
+.method-post {
+  background: rgba(74, 159, 224, 0.12);
+  color: var(--blue);
+  border: 1px solid rgba(74, 159, 224, 0.3);
+}
+.method-put {
+  background: rgba(240, 192, 64, 0.12);
+  color: var(--yellow);
+  border: 1px solid rgba(240, 192, 64, 0.3);
+}
+.method-patch {
+  background: rgba(224, 136, 68, 0.12);
+  color: var(--orange);
+  border: 1px solid rgba(224, 136, 68, 0.3);
+}
+.method-delete {
+  background: rgba(224, 85, 85, 0.12);
+  color: var(--red);
+  border: 1px solid rgba(224, 85, 85, 0.3);
+}
+.method-options {
+  background: rgba(154, 120, 232, 0.12);
+  color: var(--purple);
+  border: 1px solid rgba(154, 120, 232, 0.3);
+}
+
+/* ── Status badges ── */
+.status-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 2px;
+}
+.status-pending {
+  color: var(--dim);
+}
+.status-1xx {
+  color: var(--dim);
+}
+.status-2xx {
+  color: var(--green);
+}
+.status-3xx {
+  color: var(--blue);
+}
+.status-4xx {
+  color: var(--yellow);
+}
+.status-5xx {
+  color: var(--red);
+}
+
+/* ── WebSocket badge ── */
+.ws-badge {
+  font-size: 9px;
+  font-weight: 700;
+  background: rgba(154, 120, 232, 0.15);
+  color: var(--purple);
+  border: 1px solid rgba(154, 120, 232, 0.35);
+  padding: 1px 4px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+/* ── Shared code block ── */
+.code-block {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 10px 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--green);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.6;
+  margin: 0;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ── Empty state ── */
+.empty-state {
+  color: var(--dim);
+  font-size: 11px;
+  padding: 24px;
+  text-align: center;
+}

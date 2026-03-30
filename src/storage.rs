@@ -99,20 +99,42 @@ pub enum SortDirection {
     Desc,
 }
 
+/// Filtering criterion for HTTP status codes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StatusFilter {
+    /// Match an exact HTTP status code (e.g. `Exact(200)` matches only `200`).
+    Exact(u16),
+    /// Match any status code in the hundred-class (e.g. `Class(2)` matches 200–299).
+    Class(u8),
+}
+
+/// Field to sort [`RequestStorage::query_requests`] results by.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SortField {
+    /// Sort by request timestamp (default).
+    Timestamp,
+    /// Sort by round-trip response time; exchanges without a response sort last.
+    ResponseTime,
+}
+
 /// Filter and sort criteria for [`RequestStorage::query_requests`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryFilter {
     pub tunnel_name: Option<String>,
     /// Case-insensitive HTTP method match (e.g. `"get"` matches `"GET"`).
     pub method: Option<String>,
-    pub status: Option<u16>,
+    /// Filter by HTTP status code: exact match or hundred-class (2xx/3xx/…).
+    /// Exchanges without a response never match when this filter is set.
+    pub status: Option<StatusFilter>,
     /// Substring match against the request URL.
     pub url_contains: Option<String>,
     /// Inclusive lower bound on request timestamp.
     pub since: Option<DateTime<Utc>>,
     /// Inclusive upper bound on request timestamp.
     pub until: Option<DateTime<Utc>>,
-    /// Result sort order; defaults to [`SortDirection::Desc`] (newest first).
+    /// Field to sort by; defaults to [`SortField::Timestamp`].
+    pub sort_field: Option<SortField>,
+    /// Result sort order; defaults to [`SortDirection::Desc`] (newest/slowest first).
     pub sort_direction: Option<SortDirection>,
 }
 
@@ -133,9 +155,13 @@ impl QueryFilter {
             return false;
         }
 
-        if let Some(status) = self.status {
+        if let Some(status_filter) = &self.status {
             if let Some(response) = &exchange.response {
-                if response.status != status {
+                let ok = match status_filter {
+                    StatusFilter::Exact(code) => response.status == *code,
+                    StatusFilter::Class(class) => response.status / 100 == u16::from(*class),
+                };
+                if !ok {
                     return false;
                 }
             } else {
@@ -405,19 +431,28 @@ impl RequestStorage {
             .cloned()
             .collect();
 
-        // Sort by timestamp based on sort_direction
-        match filter.sort_direction {
-            Some(SortDirection::Asc) => {
-                results.sort_by(|a, b| a.request.timestamp.cmp(&b.request.timestamp));
+        let sort_field = filter.sort_field.as_ref().unwrap_or(&SortField::Timestamp);
+        let desc = !matches!(filter.sort_direction, Some(SortDirection::Asc));
+
+        results.sort_by(|a, b| match sort_field {
+            SortField::Timestamp => {
+                let cmp = a.request.timestamp.cmp(&b.request.timestamp);
+                if desc { cmp.reverse() } else { cmp }
             }
-            Some(SortDirection::Desc) => {
-                results.sort_by(|a, b| b.request.timestamp.cmp(&a.request.timestamp));
+            SortField::ResponseTime => {
+                let ta = a.response.as_ref().and_then(|r| r.response_time_ms);
+                let tb = b.response.as_ref().and_then(|r| r.response_time_ms);
+                match (ta, tb) {
+                    (Some(ta), Some(tb)) => {
+                        let cmp = ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal);
+                        if desc { cmp.reverse() } else { cmp }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less, // has time → before no-time
+                    (None, Some(_)) => std::cmp::Ordering::Greater, // no time → after has-time
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
             }
-            None => {
-                // Default to descending (newest first) if no sort direction specified
-                results.sort_by(|a, b| b.request.timestamp.cmp(&a.request.timestamp));
-            }
-        }
+        });
 
         results
     }
@@ -643,7 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_requests_by_status() {
+    async fn test_query_requests_by_status_exact() {
         let storage = RequestStorage::new(100);
 
         let req1 = create_test_request("req1", "tunnel1", "GET", "http://example1.com");
@@ -659,7 +694,67 @@ mod tests {
         storage.store_response(resp2).await;
 
         let filter = QueryFilter {
-            status: Some(200),
+            status: Some(StatusFilter::Exact(200)),
+            ..Default::default()
+        };
+
+        let results = storage.query_requests(&filter).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].request.id, "req1");
+    }
+
+    #[tokio::test]
+    async fn test_query_requests_by_status_class() {
+        let storage = RequestStorage::new(100);
+
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example1.com");
+        let req2 = create_test_request("req2", "tunnel1", "POST", "http://example2.com");
+        let req3 = create_test_request("req3", "tunnel1", "PUT", "http://example3.com");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+        storage.store_request(req3).await;
+
+        storage
+            .store_response(create_test_response("req1", 200))
+            .await;
+        storage
+            .store_response(create_test_response("req2", 201))
+            .await;
+        storage
+            .store_response(create_test_response("req3", 404))
+            .await;
+
+        // Class(2) should match 200 and 201 but not 404
+        let filter = QueryFilter {
+            status: Some(StatusFilter::Class(2)),
+            ..Default::default()
+        };
+
+        let results = storage.query_requests(&filter).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| {
+            let s = r.response.as_ref().unwrap().status;
+            s / 100 == 2
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_query_requests_by_status_class_no_response_excluded() {
+        let storage = RequestStorage::new(100);
+
+        // req1 has a 2xx response; req2 has no response yet
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example1.com");
+        let req2 = create_test_request("req2", "tunnel1", "GET", "http://example2.com");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+        storage
+            .store_response(create_test_response("req1", 200))
+            .await;
+
+        let filter = QueryFilter {
+            status: Some(StatusFilter::Class(2)),
             ..Default::default()
         };
 
@@ -856,6 +951,107 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].request.id, "req2"); // Newest first (default behavior)
         assert_eq!(results[1].request.id, "req1"); // Oldest last
+    }
+
+    #[tokio::test]
+    async fn test_query_requests_sort_by_response_time_asc() {
+        let storage = RequestStorage::new(100);
+
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example.com/1");
+        let req2 = create_test_request("req2", "tunnel1", "GET", "http://example.com/2");
+        let req3 = create_test_request("req3", "tunnel1", "GET", "http://example.com/3");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+        storage.store_request(req3).await;
+
+        let mut resp1 = create_test_response("req1", 200);
+        resp1.response_time_ms = Some(300.0);
+        let mut resp2 = create_test_response("req2", 200);
+        resp2.response_time_ms = Some(100.0);
+        let mut resp3 = create_test_response("req3", 200);
+        resp3.response_time_ms = Some(200.0);
+
+        storage.store_response(resp1).await;
+        storage.store_response(resp2).await;
+        storage.store_response(resp3).await;
+
+        let filter = QueryFilter {
+            sort_field: Some(SortField::ResponseTime),
+            sort_direction: Some(SortDirection::Asc),
+            ..Default::default()
+        };
+
+        let results = storage.query_requests(&filter).await;
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].request.id, "req2"); // 100ms — fastest
+        assert_eq!(results[1].request.id, "req3"); // 200ms
+        assert_eq!(results[2].request.id, "req1"); // 300ms — slowest
+    }
+
+    #[tokio::test]
+    async fn test_query_requests_sort_by_response_time_desc() {
+        let storage = RequestStorage::new(100);
+
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example.com/1");
+        let req2 = create_test_request("req2", "tunnel1", "GET", "http://example.com/2");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+
+        let mut resp1 = create_test_response("req1", 200);
+        resp1.response_time_ms = Some(50.0);
+        let mut resp2 = create_test_response("req2", 200);
+        resp2.response_time_ms = Some(150.0);
+
+        storage.store_response(resp1).await;
+        storage.store_response(resp2).await;
+
+        let filter = QueryFilter {
+            sort_field: Some(SortField::ResponseTime),
+            sort_direction: Some(SortDirection::Desc),
+            ..Default::default()
+        };
+
+        let results = storage.query_requests(&filter).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request.id, "req2"); // 150ms — slowest first
+        assert_eq!(results[1].request.id, "req1"); // 50ms
+    }
+
+    #[tokio::test]
+    async fn test_query_requests_sort_by_response_time_missing_last() {
+        let storage = RequestStorage::new(100);
+
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example.com/1");
+        let req2 = create_test_request("req2", "tunnel1", "GET", "http://example.com/2");
+        let req3 = create_test_request("req3", "tunnel1", "GET", "http://example.com/3");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+        storage.store_request(req3).await;
+
+        // req1: has response time; req2: no response (pending); req3: response without time
+        let mut resp1 = create_test_response("req1", 200);
+        resp1.response_time_ms = Some(100.0);
+        let mut resp3 = create_test_response("req3", 200);
+        resp3.response_time_ms = None;
+
+        storage.store_response(resp1).await;
+        storage.store_response(resp3).await;
+
+        let filter = QueryFilter {
+            sort_field: Some(SortField::ResponseTime),
+            sort_direction: Some(SortDirection::Asc),
+            ..Default::default()
+        };
+
+        let results = storage.query_requests(&filter).await;
+        assert_eq!(results.len(), 3);
+        // req1 (100ms) comes first; req2 and req3 (no time) come last in any order
+        assert_eq!(results[0].request.id, "req1");
+        assert!(results[1..].iter().any(|r| r.request.id == "req2"));
+        assert!(results[1..].iter().any(|r| r.request.id == "req3"));
     }
 
     fn create_test_websocket_message(

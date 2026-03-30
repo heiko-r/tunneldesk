@@ -44,4 +44,40 @@ hooks = [
     types = ["rust"],
     pass_filenames = false
   },
+  {
+    id = "prettier",
+    name = "prettier",
+    description = "Format frontend files with prettier",
+    entry = "bash -c 'source ~/.nvm/nvm.sh && nvm use 24 && cd frontend && npx prettier --write .'",
+    language = "system",
+    files = "^frontend/",
+    pass_filenames = false
+  },
+  {
+    id = "eslint",
+    name = "eslint",
+    description = "Lint frontend files with eslint",
+    entry = "bash -c 'source ~/.nvm/nvm.sh && nvm use 24 && cd frontend && npx eslint .'",
+    language = "system",
+    files = "^frontend/",
+    pass_filenames = false
+  },
+  {
+    id = "svelte-check",
+    name = "svelte-check",
+    description = "Type-check frontend with svelte-check",
+    entry = "bash -c 'source ~/.nvm/nvm.sh && nvm use 24 && cd frontend && npx svelte-kit sync && npx svelte-check --tsconfig ./tsconfig.json'",
+    language = "system",
+    files = "^frontend/",
+    pass_filenames = false
+  },
+  {
+    id = "frontend-test",
+    name = "frontend test",
+    description = "Run frontend tests with vitest",
+    entry = "bash -c 'source ~/.nvm/nvm.sh && nvm use 24 && cd frontend && npm run test'",
+    language = "system",
+    files = "^frontend/",
+    pass_filenames = false
+  },
 ]

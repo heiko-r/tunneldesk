@@ -13,7 +13,8 @@ A local HTTP proxy that forwards requests from Unix domain sockets to TCP ports 
 ## Installation
 
 ```bash
-cargo build --release
+cd frontend && npm run build
+cd .. && cargo build --release
 ```
 
 ## Usage
@@ -93,6 +94,8 @@ Each tunnel supports:
 
 ## Development
 
+### Proxy
+
 ```bash
 # Run in development mode
 cargo run
@@ -102,6 +105,16 @@ cargo test
 
 # Build for release
 cargo build --release
+```
+
+### Web UI
+
+```bash
+# Run in development mode (served from Vite dev server)
+npm run dev
+
+# Build for release (served from proxy app)
+npm run build
 ```
 
 ## License
