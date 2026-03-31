@@ -1186,6 +1186,7 @@ mod tests {
             domain: "test.tunnel.example.com".to_string(),
             socket_path: "/tmp/test.sock".to_string(),
             target_port: 8080,
+            enabled: true,
         };
 
         let storage = Arc::new(crate::storage::RequestStorage::new(100));

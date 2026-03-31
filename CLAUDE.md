@@ -46,7 +46,7 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 
 ## Development Validation
 
-- Run `prek run` to verify any changes
+- Run `prek run --all-files` to verify any changes
 
 ## Environment
 
@@ -66,3 +66,4 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 - `*.svelte.spec.ts` files run in Chromium via Playwright (browser project)
 - Plain `*.spec.ts` files run in Node (server project)
 - Import `page` from `vitest/browser` (not the deprecated `@vitest/browser/context`)
+- `page.locator()` does not exist on `BrowserPage` (vitest-browser-svelte). Use `page.getByRole()`, `page.getByText()`, or `page.getByTestId()` only.                                                                                                                                       - Run `npx playwright install chromium` before the first browser test run on a new machine.

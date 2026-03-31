@@ -14,6 +14,9 @@ export type Tunnel = {
   domain: string;
   localPort: number;
   active: boolean;
+  /** Whether Cloudflare routing is enabled for this tunnel. */
+  enabled: boolean;
+  socketPath: string;
 };
 
 export type TunneledRequest = {
@@ -37,3 +40,17 @@ export type TunneledRequest = {
 };
 
 export type RequestTab = "headers" | "request" | "response" | "ws";
+
+export type CloudflareStatus = {
+  configured: boolean;
+  tunnelId?: string;
+  tunnelName?: string;
+  serviceRunning: boolean;
+};
+
+export type SyncReport = {
+  added: string[];
+  removed: string[];
+  unknownHosts: string[];
+  errors: string[];
+};

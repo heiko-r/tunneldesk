@@ -1,16 +1,15 @@
 <script lang="ts">
   import type { Tunnel, TunneledRequest } from "$lib/types";
+  import { updateTunnelRemote } from "$lib/api/websocket.svelte";
 
   let {
     tunnel,
     requests,
     onclear,
-    ontoggle,
   }: {
     tunnel: Tunnel;
     requests: TunneledRequest[];
     onclear: () => void;
-    ontoggle: () => void;
   } = $props();
 
   /** Estimates total transferred bytes from base64-encoded bodies. */
@@ -24,15 +23,19 @@
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
   }
+
+  function toggleEnabled() {
+    updateTunnelRemote(tunnel.name, { enabled: !tunnel.enabled });
+  }
 </script>
 
 <div class="tunnel-header">
   <div class="th-left">
-    <span class="indicator lg" class:on={tunnel.active}></span>
+    <span class="indicator lg" class:on={tunnel.enabled}></span>
     <div>
       <div class="th-title">{tunnel.name}</div>
       <div class="th-sub">
-        <span class="dim">{tunnel.active ? "https" : "http"}://</span>{tunnel.domain}
+        <span class="dim">{tunnel.enabled ? "https" : "http"}://</span>{tunnel.domain}
         <span class="dim"> → </span>localhost:{tunnel.localPort}
       </div>
     </div>
@@ -48,15 +51,15 @@
     </div>
     <div class="stat-chip">
       <span class="sc-label">STATUS</span>
-      <span class="sc-val" class:green={tunnel.active} class:dim={!tunnel.active}>
-        {tunnel.active ? "ONLINE" : "OFFLINE"}
+      <span class="sc-val" class:green={tunnel.enabled} class:dim={!tunnel.enabled}>
+        {tunnel.enabled ? "ENABLED" : "DISABLED"}
       </span>
     </div>
   </div>
   <div class="th-actions">
     <button class="btn-sm" onclick={onclear}>CLEAR LOG</button>
-    <button class="btn-sm {tunnel.active ? 'btn-stop' : 'btn-start'}" onclick={ontoggle}>
-      {tunnel.active ? "STOP" : "START"}
+    <button class="btn-sm {tunnel.enabled ? 'btn-stop' : 'btn-start'}" onclick={toggleEnabled}>
+      {tunnel.enabled ? "DISABLE" : "ENABLE"}
     </button>
   </div>
 </div>

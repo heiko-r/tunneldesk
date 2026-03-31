@@ -2,8 +2,10 @@
   import Sidebar from "$lib/components/sidebar/Sidebar.svelte";
   import TunnelDetails from "$lib/components/details/TunnelDetails.svelte";
   import Modal from "$lib/components/modal/Modal.svelte";
+  import SyncReportModal from "$lib/components/modal/SyncReportModal.svelte";
   import type { Tunnel } from "$lib/types";
-  import { storage, updateTunnels } from "$lib/stores.svelte";
+  import { storage, lastSyncReport } from "$lib/stores.svelte";
+  import { createTunnel, updateTunnelRemote, deleteTunnel } from "$lib/api/websocket.svelte";
 
   // ─── UI State ─────────────────────────────────────────────────────────────────
   let selectedTunnelName = $state("t1");
@@ -13,18 +15,42 @@
   let showAddModal = $state(false);
   let showEditModal = $state(false);
   let editTunnel: Tunnel | null = $state(null);
-  let newTunnel = $state({ name: "", domain: "", localPort: "", protocol: "https" });
+  let newTunnel = $state({ name: "", domain: "", localPort: "" });
   let confirmDelete: string | null = $state(null);
 
   // ─── Derived ──────────────────────────────────────────────────────────────────
   let selectedTunnel = $derived(storage.tunnels.find((t) => t.name === selectedTunnelName));
+  let showSyncReport = $derived(
+    lastSyncReport.value !== null &&
+      (lastSyncReport.value.unknownHosts.length > 0 ||
+        lastSyncReport.value.added.length > 0 ||
+        lastSyncReport.value.errors.length > 0),
+  );
 
-  function saveEdit() {
-    if (editTunnel) {
-      updateTunnels(storage.tunnels.map((t) => (t.name === editTunnel!.name ? editTunnel! : t)));
-    }
+  function handleCreate() {
+    const port = parseInt(newTunnel.localPort, 10);
+    if (!newTunnel.name || !newTunnel.domain || isNaN(port)) return;
+    createTunnel(newTunnel.name, newTunnel.domain, port);
+    newTunnel = { name: "", domain: "", localPort: "" };
+    showAddModal = false;
+  }
+
+  function handleSaveEdit() {
+    if (!editTunnel) return;
+    updateTunnelRemote(editTunnel.name, {
+      domain: editTunnel.domain,
+      targetPort: editTunnel.localPort,
+    });
     showEditModal = false;
     editTunnel = null;
+  }
+
+  function handleDelete() {
+    if (confirmDelete) {
+      deleteTunnel(confirmDelete);
+      if (selectedTunnelName === confirmDelete) selectedTunnelName = "";
+    }
+    confirmDelete = null;
   }
 </script>
 
@@ -35,6 +61,9 @@
     bind:showAddModal
     bind:selectedTunnelName
     bind:selectedRequestId
+    bind:editTunnel
+    bind:showEditModal
+    bind:confirmDelete
   />
 
   <main class="main">
@@ -66,40 +95,23 @@
       placeholder="3000"
     /></label
   >
-  <label class="mlabel"
-    >PROTOCOL
-    <select class="minput" bind:value={newTunnel.protocol}>
-      <option>https</option><option>http</option><option>wss</option>
-    </select>
-  </label>
   <div class="modal-actions">
     <button class="btn-sm" onclick={() => (showAddModal = false)}>CANCEL</button>
-    <button
-      class="btn-sm btn-start"
-      onclick={() => {
-        /* TODO: implement addTunnel */
-      }}>CREATE</button
-    >
+    <button class="btn-sm btn-start" onclick={handleCreate}>CREATE</button>
   </div>
 </Modal>
 
 <!-- ── Edit Modal ─────────────────────────────────────────────────────────── -->
 {#if editTunnel}
   <Modal open={showEditModal} title="EDIT TUNNEL" onclose={() => (showEditModal = false)}>
-    <label class="mlabel">NAME<input class="minput" bind:value={editTunnel.name} /></label>
+    <label class="mlabel">NAME<input class="minput" value={editTunnel.name} disabled /></label>
     <label class="mlabel">DOMAIN<input class="minput" bind:value={editTunnel.domain} /></label>
     <label class="mlabel"
       >LOCAL PORT<input class="minput" type="number" bind:value={editTunnel.localPort} /></label
     >
-    <label class="mlabel"
-      >PROTOCOL
-      <select class="minput" bind:value={(editTunnel as Tunnel & { protocol?: string }).protocol}>
-        <option>https</option><option>http</option><option>wss</option>
-      </select>
-    </label>
     <div class="modal-actions">
       <button class="btn-sm" onclick={() => (showEditModal = false)}>CANCEL</button>
-      <button class="btn-sm btn-start" onclick={saveEdit}>SAVE</button>
+      <button class="btn-sm btn-start" onclick={handleSaveEdit}>SAVE</button>
     </div>
   </Modal>
 {/if}
@@ -114,14 +126,14 @@
   <p class="modal-body">This will remove the tunnel and all recorded requests.</p>
   <div class="modal-actions">
     <button class="btn-sm" onclick={() => (confirmDelete = null)}>CANCEL</button>
-    <button
-      class="btn-sm btn-stop"
-      onclick={() => {
-        /* TODO: implement deleteTunnel */ confirmDelete = null;
-      }}>DELETE</button
-    >
+    <button class="btn-sm btn-stop" onclick={handleDelete}>DELETE</button>
   </div>
 </Modal>
+
+<!-- ── Sync Report Modal ───────────────────────────────────────────────────── -->
+{#if showSyncReport && lastSyncReport.value}
+  <SyncReportModal report={lastSyncReport.value} onclose={() => (lastSyncReport.value = null)} />
+{/if}
 
 <!-- ═══════════════════════════════════════════════════════════════ STYLES -->
 <style>
@@ -168,6 +180,10 @@
   }
   .minput:focus {
     border-color: var(--green2);
+  }
+  .minput:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .modal-actions {
     display: flex;

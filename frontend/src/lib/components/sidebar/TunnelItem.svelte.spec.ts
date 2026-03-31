@@ -4,56 +4,108 @@ import { page } from "vitest/browser";
 import TunnelItem from "./TunnelItem.svelte";
 import type { Tunnel } from "$lib/types";
 
-const activeTunnel: Tunnel = {
+const enabledTunnel: Tunnel = {
   name: "my-api",
   domain: "myapi.example.com",
   localPort: 3000,
   active: true,
+  enabled: true,
+  socketPath: "/tmp/my-api.sock",
 };
 
-const inactiveTunnel: Tunnel = { ...activeTunnel, active: false };
+const disabledTunnel: Tunnel = { ...enabledTunnel, enabled: false };
+
+const defaultProps = {
+  onclick: vi.fn(),
+  onedit: vi.fn(),
+  ondelete: vi.fn(),
+};
 
 describe("TunnelItem", () => {
   it("renders the tunnel name, domain, and port", async () => {
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: false, onclick: vi.fn() } });
+    render(TunnelItem, { props: { tunnel: enabledTunnel, selected: false, ...defaultProps } });
     await expect.element(page.getByText("my-api")).toBeInTheDocument();
     await expect.element(page.getByText("myapi.example.com")).toBeInTheDocument();
     await expect.element(page.getByText(":3000")).toBeInTheDocument();
   });
 
-  it("applies selected class when selected is true", async () => {
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: true, onclick: vi.fn() } });
-    const btn = page.getByRole("button");
-    await expect.element(btn).toHaveClass("selected");
+  it("applies selected class on wrapper when selected is true", async () => {
+    render(TunnelItem, { props: { tunnel: enabledTunnel, selected: true, ...defaultProps } });
+    // The wrapper div has the selected class
+    const el = document.querySelector(".tunnel-item-wrap");
+    expect(el?.classList.contains("selected")).toBe(true);
   });
 
   it("does not apply selected class when selected is false", async () => {
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: false, onclick: vi.fn() } });
-    const btn = page.getByRole("button");
-    await expect.element(btn).not.toHaveClass("selected");
+    render(TunnelItem, { props: { tunnel: enabledTunnel, selected: false, ...defaultProps } });
+    const el = document.querySelector(".tunnel-item-wrap");
+    expect(el?.classList.contains("selected")).toBe(false);
   });
 
-  it("applies inactive class when tunnel is not active", async () => {
-    render(TunnelItem, { props: { tunnel: inactiveTunnel, selected: false, onclick: vi.fn() } });
-    const btn = page.getByRole("button");
-    await expect.element(btn).toHaveClass("inactive");
+  it("applies inactive class on inner button when tunnel is disabled", async () => {
+    render(TunnelItem, { props: { tunnel: disabledTunnel, selected: false, ...defaultProps } });
+    const el = document.querySelector(".tunnel-item");
+    expect(el?.classList.contains("inactive")).toBe(true);
   });
 
-  it("does not apply inactive class when tunnel is active", async () => {
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: false, onclick: vi.fn() } });
-    const btn = page.getByRole("button");
-    await expect.element(btn).not.toHaveClass("inactive");
+  it("does not apply inactive class when tunnel is enabled", async () => {
+    render(TunnelItem, { props: { tunnel: enabledTunnel, selected: false, ...defaultProps } });
+    const el = document.querySelector(".tunnel-item");
+    expect(el?.classList.contains("inactive")).toBe(false);
   });
 
-  it("calls onclick when clicked", async () => {
+  it("shows DISABLED badge when tunnel is disabled", async () => {
+    render(TunnelItem, { props: { tunnel: disabledTunnel, selected: false, ...defaultProps } });
+    await expect.element(page.getByText("DISABLED")).toBeInTheDocument();
+  });
+
+  it("does not show DISABLED badge when tunnel is enabled", async () => {
+    render(TunnelItem, { props: { tunnel: enabledTunnel, selected: false, ...defaultProps } });
+    expect(document.querySelector(".badge-disabled")).toBeNull();
+  });
+
+  it("calls onclick when the main tunnel button is clicked", async () => {
     const onclick = vi.fn();
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: false, onclick } });
-    await page.getByRole("button").click();
+    render(TunnelItem, {
+      props: {
+        tunnel: enabledTunnel,
+        selected: false,
+        onclick,
+        onedit: vi.fn(),
+        ondelete: vi.fn(),
+      },
+    });
+    await page.getByRole("button", { name: "my-api" }).first().click();
     expect(onclick).toHaveBeenCalledOnce();
   });
 
-  it("renders as a button element for keyboard accessibility", async () => {
-    render(TunnelItem, { props: { tunnel: activeTunnel, selected: false, onclick: vi.fn() } });
-    await expect.element(page.getByRole("button")).toBeInTheDocument();
+  it("calls onedit when edit button is clicked", async () => {
+    const onedit = vi.fn();
+    render(TunnelItem, {
+      props: {
+        tunnel: enabledTunnel,
+        selected: false,
+        onclick: vi.fn(),
+        onedit,
+        ondelete: vi.fn(),
+      },
+    });
+    await page.getByRole("button", { name: "Edit my-api" }).click();
+    expect(onedit).toHaveBeenCalledOnce();
+  });
+
+  it("calls ondelete when delete button is clicked", async () => {
+    const ondelete = vi.fn();
+    render(TunnelItem, {
+      props: {
+        tunnel: enabledTunnel,
+        selected: false,
+        onclick: vi.fn(),
+        onedit: vi.fn(),
+        ondelete,
+      },
+    });
+    await page.getByRole("button", { name: "Delete my-api" }).click();
+    expect(ondelete).toHaveBeenCalledOnce();
   });
 });

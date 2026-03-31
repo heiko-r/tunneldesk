@@ -42,6 +42,14 @@ max_request_body_size = 1024
 max_stored_requests = 1000
 max_request_body_size = 10485760
 
+[cloudflare]
+api_token = "your-api-token-here"
+account_id = "your-account-id"
+zone_id = "your-zone-id"
+tunnel_id = "your-tunnel-id" # Optional, will be populated automatically
+tunnel_name = "your-tunnel-name" # Optional, will be populated automatically
+tunnel_token = "your-tunnel-token" # Optional, will be populated automatically
+
 [[tunnels]]
 name = "webapp"
 domain = "webapp.example.com"

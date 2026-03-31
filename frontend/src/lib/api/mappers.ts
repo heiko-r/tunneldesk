@@ -1,4 +1,4 @@
-import type { HttpMethod, TunneledRequest } from "$lib/types";
+import type { HttpMethod, Tunnel, TunneledRequest } from "$lib/types";
 
 type RawRequest = {
   id: string;
@@ -23,6 +23,28 @@ type RawWsMessage = {
   message_type: "Text" | "Binary";
   payload: string;
 };
+
+type RawTunnel = {
+  name: string;
+  domain: string;
+  socket_path: string;
+  destination: number;
+  enabled: boolean;
+};
+
+/**
+ * Maps a raw tunnel object from the WebSocket API to a Tunnel.
+ */
+export function mapToTunnel(raw: RawTunnel): Tunnel {
+  return {
+    name: raw.name,
+    domain: raw.domain,
+    localPort: raw.destination,
+    socketPath: raw.socket_path,
+    active: true,
+    enabled: raw.enabled,
+  };
+}
 
 /**
  * Maps a raw request/response pair from the WebSocket API to a TunneledRequest.
@@ -68,4 +90,4 @@ export function parseWsDirection(direction: string): "in" | "out" {
   return direction === "→" ? "out" : "in";
 }
 
-export type { RawRequest, RawResponse, RawWsMessage };
+export type { RawRequest, RawResponse, RawTunnel, RawWsMessage };

@@ -1,5 +1,5 @@
 import { SvelteMap } from "svelte/reactivity";
-import type { Tunnel, TunneledRequest } from "./types";
+import type { CloudflareStatus, SyncReport, Tunnel, TunneledRequest } from "./types";
 
 /** Global reactive store for all tunnels and their captured requests. */
 export const storage: { tunnels: Tunnel[]; requests: SvelteMap<string, TunneledRequest[]> } =
@@ -7,6 +7,12 @@ export const storage: { tunnels: Tunnel[]; requests: SvelteMap<string, TunneledR
     tunnels: [],
     requests: new SvelteMap<string, TunneledRequest[]>(),
   });
+
+/** Cloudflare integration status, populated by GetCloudflareStatus responses. */
+export const cloudflareStatus: { value: CloudflareStatus | null } = $state({ value: null });
+
+/** Latest sync report, populated by SyncReport responses. */
+export const lastSyncReport: { value: SyncReport | null } = $state({ value: null });
 
 type StatusFilter = { Exact: number } | { Class: number };
 type ActiveQueryFilter = {
@@ -34,6 +40,22 @@ export function setActiveQueryFilter(filter: ActiveQueryFilter) {
 /** Replaces the full list of tunnels (e.g., after receiving a Tunnels message). */
 export function updateTunnels(newTunnels: Tunnel[]) {
   storage.tunnels = newTunnels;
+}
+
+/** Updates a single tunnel in the list by name. */
+export function updateTunnel(updated: Tunnel) {
+  storage.tunnels = storage.tunnels.map((t) => (t.name === updated.name ? updated : t));
+}
+
+/** Adds a new tunnel to the list. */
+export function addTunnel(tunnel: Tunnel) {
+  storage.tunnels = [...storage.tunnels, tunnel];
+}
+
+/** Removes a tunnel from the list by name. */
+export function removeTunnel(name: string) {
+  storage.tunnels = storage.tunnels.filter((t) => t.name !== name);
+  storage.requests.delete(name);
 }
 
 /** Sets the full request list for a specific tunnel, replacing any existing entries. */

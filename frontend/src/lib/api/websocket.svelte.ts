@@ -1,27 +1,20 @@
 import {
   getActiveQueryFilter,
   addRequests,
+  addTunnel,
   addWsMessage,
+  cloudflareStatus,
+  lastSyncReport,
+  removeTunnel,
   setWsMessages,
   updateRequests,
+  updateTunnel,
   updateTunnels,
 } from "$lib/stores.svelte";
-import { mapToTunneledRequest, decodeWsPayload, parseWsDirection } from "./mappers";
+import { mapToTunnel, mapToTunneledRequest, decodeWsPayload, parseWsDirection } from "./mappers";
+import type { RawTunnel } from "./mappers";
 
-type QueryType =
-  | "ListTunnels"
-  | "QueryRequests"
-  | "QueryWebSocketMessages"
-  | "Subscribe"
-  | "Unsubscribe";
-const RESPONSE_TYPES = [
-  "Tunnels",
-  "Requests",
-  "NewRequest",
-  "WebSocketMessages",
-  "NewWebSocketMessage",
-] as const;
-type ResponseType = (typeof RESPONSE_TYPES)[number];
+// ── Protocol types ────────────────────────────────────────────────────────────
 
 type StatusFilter = { Exact: number } | { Class: number };
 
@@ -35,20 +28,6 @@ type QueryFilter = {
   sort_field?: "Timestamp" | "ResponseTime";
   sort_direction?: "Asc" | "Desc";
 };
-
-type QueryPayload = {
-  type: QueryType;
-  data?: QueryFilter;
-};
-
-type ResponseTunnel = {
-  name: string;
-  domain: string;
-  socket_path: string;
-  destination: number;
-};
-
-type TunnelsResponse = { type: "Tunnels"; data: ResponseTunnel[] };
 
 type RawRequestData = {
   id: string;
@@ -71,16 +50,6 @@ type RawResponseData = {
   raw_response: string;
 };
 
-type RequestsResponse = {
-  type: "Requests";
-  data: { request: RawRequestData; response?: RawResponseData }[];
-};
-
-type NewRequestResponse = {
-  type: "NewRequest";
-  data: { request: RawRequestData; response?: RawResponseData };
-};
-
 type WsMessageData = {
   id: string;
   timestamp: string;
@@ -91,13 +60,54 @@ type WsMessageData = {
   payload: string;
 };
 
+// ── Response shapes ───────────────────────────────────────────────────────────
+
+type TunnelsResponse = { type: "Tunnels"; data: RawTunnel[] };
+type RequestsResponse = {
+  type: "Requests";
+  data: { request: RawRequestData; response?: RawResponseData }[];
+};
+type NewRequestResponse = {
+  type: "NewRequest";
+  data: { request: RawRequestData; response?: RawResponseData };
+};
 type WebSocketMessagesResponse = { type: "WebSocketMessages"; data: WsMessageData[] };
 type NewWebSocketMessageResponse = { type: "NewWebSocketMessage"; data: WsMessageData };
+
+type TunnelCreatedResponse = { type: "TunnelCreated"; data: RawTunnel };
+type TunnelUpdatedResponse = { type: "TunnelUpdated"; data: RawTunnel };
+type TunnelDeletedResponse = { type: "TunnelDeleted"; data: { name: string } };
+
+type SyncReportResponse = {
+  type: "SyncReport";
+  data: {
+    added: string[];
+    removed: string[];
+    unknown_hosts: string[];
+    errors: string[];
+  };
+};
+
+type CloudflareStatusResponse = {
+  type: "CloudflareStatus";
+  data: {
+    configured: boolean;
+    tunnel_id?: string;
+    tunnel_name?: string;
+    service_running: boolean;
+  };
+};
+
+type ErrorResponse = { type: "Error"; data: string };
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 let ws: WebSocket | null = null;
 
 /** Reactive connection state. Mutate `.connected` rather than reassigning. */
 export const connectionState = $state({ connected: false });
+
+// ── Connection ────────────────────────────────────────────────────────────────
 
 function connect() {
   const host = import.meta.env.DEV
@@ -110,31 +120,48 @@ function connect() {
     connectionState.connected = true;
     console.log("WebSocket connected");
     queryTunnels();
+    getCloudflareStatus();
   };
 
   ws.onmessage = (event) => {
     try {
       const message = JSON.parse(event.data);
-      console.log("Received message:", message);
-      const messageType: string | undefined = message["type"];
-      if (!messageType || !RESPONSE_TYPES.includes(messageType as ResponseType)) return;
-
-      switch (messageType) {
+      switch (message.type) {
         case "Tunnels":
-          handleTunnelsMessage(message);
+          handleTunnelsMessage(message as TunnelsResponse);
           break;
         case "Requests":
-          handleRequestsMessage(message);
+          handleRequestsMessage(message as RequestsResponse);
           break;
         case "NewRequest":
-          handleNewRequestMessage(message);
+          handleNewRequestMessage(message as NewRequestResponse);
           break;
         case "WebSocketMessages":
-          handleWebSocketMessagesMessage(message);
+          handleWebSocketMessagesMessage(message as WebSocketMessagesResponse);
           break;
         case "NewWebSocketMessage":
-          handleNewWebSocketMessageMessage(message);
+          handleNewWebSocketMessageMessage(message as NewWebSocketMessageResponse);
           break;
+        case "TunnelCreated":
+          handleTunnelCreatedMessage(message as TunnelCreatedResponse);
+          break;
+        case "TunnelUpdated":
+          handleTunnelUpdatedMessage(message as TunnelUpdatedResponse);
+          break;
+        case "TunnelDeleted":
+          handleTunnelDeletedMessage(message as TunnelDeletedResponse);
+          break;
+        case "SyncReport":
+          handleSyncReportMessage(message as SyncReportResponse);
+          break;
+        case "CloudflareStatus":
+          handleCloudflareStatusMessage(message as CloudflareStatusResponse);
+          break;
+        case "Error":
+          handleErrorMessage(message as ErrorResponse);
+          break;
+        default:
+          console.warn("Unknown message type:", message.type);
       }
     } catch (error) {
       console.error("Error parsing message:", error);
@@ -153,22 +180,15 @@ function connect() {
   };
 }
 
+// ── Response handlers ─────────────────────────────────────────────────────────
+
 function handleTunnelsMessage(message: TunnelsResponse) {
-  updateTunnels(
-    message.data.map((t) => ({
-      name: t.name,
-      domain: t.domain,
-      localPort: t.destination,
-      active: true,
-    })),
-  );
+  updateTunnels(message.data.map(mapToTunnel));
 }
 
 function handleRequestsMessage(message: RequestsResponse) {
   const requestsPerTunnel: { [tunnelName: string]: ReturnType<typeof mapToTunneledRequest>[] } = {};
 
-  // When the server returns an empty result, ensure the queried tunnel's store is cleared.
-  // Without this, an empty response would leave stale entries visible in the UI.
   if (message.data.length === 0) {
     const tunnelName = getActiveQueryFilter()?.tunnelName;
     if (tunnelName) requestsPerTunnel[tunnelName] = [];
@@ -222,24 +242,53 @@ function handleNewWebSocketMessageMessage(message: NewWebSocketMessageResponse) 
   });
 }
 
-/**
- * Requests the current list of configured tunnels from the server.
- */
+function handleTunnelCreatedMessage(message: TunnelCreatedResponse) {
+  addTunnel(mapToTunnel(message.data));
+}
+
+function handleTunnelUpdatedMessage(message: TunnelUpdatedResponse) {
+  updateTunnel(mapToTunnel(message.data));
+}
+
+function handleTunnelDeletedMessage(message: TunnelDeletedResponse) {
+  removeTunnel(message.data.name);
+}
+
+function handleSyncReportMessage(message: SyncReportResponse) {
+  lastSyncReport.value = {
+    added: message.data.added,
+    removed: message.data.removed,
+    unknownHosts: message.data.unknown_hosts,
+    errors: message.data.errors,
+  };
+}
+
+function handleCloudflareStatusMessage(message: CloudflareStatusResponse) {
+  cloudflareStatus.value = {
+    configured: message.data.configured,
+    tunnelId: message.data.tunnel_id,
+    tunnelName: message.data.tunnel_name,
+    serviceRunning: message.data.service_running,
+  };
+}
+
+function handleErrorMessage(message: ErrorResponse) {
+  console.error("Server error:", message.data);
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+function send(payload: unknown) {
+  ws?.send(JSON.stringify(payload));
+}
+
+/** Requests the current list of configured tunnels from the server. */
 export function queryTunnels() {
-  const query: QueryPayload = { type: "ListTunnels" };
-  ws?.send(JSON.stringify(query));
+  send({ type: "ListTunnels" });
 }
 
 /**
  * Requests stored requests for a specific tunnel, with optional filters.
- * @param tunnelName - Name of the tunnel to query
- * @param method - Filter by HTTP method
- * @param status - Filter by status: exact code or hundred-class (e.g. `{ Class: 2 }` for 2xx)
- * @param urlContains - Filter by URL substring
- * @param since - Return only requests after this date
- * @param until - Return only requests before this date
- * @param sortField - Field to sort by ('Timestamp' or 'ResponseTime')
- * @param sortDirection - Sort order ('Asc' or 'Desc')
  */
 export function queryRequests(
   tunnelName: string,
@@ -251,32 +300,72 @@ export function queryRequests(
   sortField?: "Timestamp" | "ResponseTime",
   sortDirection?: "Asc" | "Desc",
 ) {
-  const query: QueryPayload = {
-    type: "QueryRequests",
-    data: {
-      tunnel_name: tunnelName,
-      method,
-      status,
-      url_contains: urlContains,
-      since: since?.toISOString(),
-      until: until?.toISOString(),
-      sort_field: sortField,
-      sort_direction: sortDirection,
-    },
+  const data: QueryFilter = {
+    tunnel_name: tunnelName,
+    method,
+    status,
+    url_contains: urlContains,
+    since: since?.toISOString(),
+    until: until?.toISOString(),
+    sort_field: sortField,
+    sort_direction: sortDirection,
   };
-  ws?.send(JSON.stringify(query));
+  send({ type: "QueryRequests", data });
 }
 
-/**
- * Requests stored WebSocket messages for a given upgraded HTTP request.
- * @param requestId - The ID of the WebSocket upgrade request
- */
+/** Requests stored WebSocket messages for a given upgraded HTTP request. */
 export function queryWebSocketMessages(requestId: string) {
-  const query = {
-    type: "QueryWebSocketMessages",
-    data: { upgrade_request_id: requestId },
-  };
-  ws?.send(JSON.stringify(query));
+  send({ type: "QueryWebSocketMessages", data: { upgrade_request_id: requestId } });
+}
+
+/** Creates a new tunnel (persists to config.toml and optionally Cloudflare). */
+export function createTunnel(
+  name: string,
+  domain: string,
+  targetPort: number,
+  socketPath?: string,
+) {
+  send({
+    type: "CreateTunnel",
+    data: { name, domain, target_port: targetPort, socket_path: socketPath ?? null },
+  });
+}
+
+/** Updates an existing tunnel's properties. */
+export function updateTunnelRemote(
+  name: string,
+  updates: { domain?: string; socketPath?: string; targetPort?: number; enabled?: boolean },
+) {
+  send({
+    type: "UpdateTunnel",
+    data: {
+      name,
+      domain: updates.domain ?? null,
+      socket_path: updates.socketPath ?? null,
+      target_port: updates.targetPort ?? null,
+      enabled: updates.enabled ?? null,
+    },
+  });
+}
+
+/** Deletes a tunnel (removes from config.toml and Cloudflare). */
+export function deleteTunnel(name: string) {
+  send({ type: "DeleteTunnel", data: { name } });
+}
+
+/** Triggers a full sync of enabled tunnels to Cloudflare. */
+export function syncTunnels() {
+  send({ type: "SyncTunnels" });
+}
+
+/** Confirms removal of unknown hosts found during sync. */
+export function confirmRemoveHosts(hosts: string[]) {
+  send({ type: "ConfirmRemoveHosts", data: { hosts } });
+}
+
+/** Requests the current Cloudflare integration status. */
+export function getCloudflareStatus() {
+  send({ type: "GetCloudflareStatus" });
 }
 
 connect();

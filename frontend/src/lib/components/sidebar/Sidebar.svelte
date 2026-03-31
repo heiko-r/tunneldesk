@@ -1,18 +1,26 @@
 <script lang="ts">
   import type { Tunnel } from "$lib/types";
-  import { queryRequests } from "$lib/api/websocket.svelte";
+  import { queryRequests, syncTunnels } from "$lib/api/websocket.svelte";
+  import { cloudflareStatus } from "$lib/stores.svelte";
   import TunnelItem from "./TunnelItem.svelte";
+  import CloudflareStatus from "./CloudflareStatus.svelte";
 
   let {
     tunnels,
     showAddModal = $bindable(),
     selectedTunnelName = $bindable(),
     selectedRequestId = $bindable(),
+    editTunnel = $bindable(),
+    showEditModal = $bindable(),
+    confirmDelete = $bindable(),
   }: {
     tunnels: Tunnel[];
     showAddModal: boolean;
     selectedTunnelName: string | null;
     selectedRequestId: string | null;
+    editTunnel: Tunnel | null;
+    showEditModal: boolean;
+    confirmDelete: string | null;
   } = $props();
 
   function selectTunnel(name: string) {
@@ -20,18 +28,41 @@
     selectedRequestId = null;
     queryRequests(name);
   }
+
+  function openEdit(tunnel: Tunnel) {
+    editTunnel = { ...tunnel };
+    showEditModal = true;
+  }
+
+  function openDelete(name: string) {
+    confirmDelete = name;
+  }
 </script>
 
 <aside class="sidebar">
   <div class="sidebar-header">
     <span class="logo">⬡ TUNNELDESK</span>
-    <button
-      class="btn-icon"
-      title="New tunnel"
-      aria-label="New tunnel"
-      onclick={() => (showAddModal = true)}>+</button
-    >
+    <div class="header-actions">
+      {#if cloudflareStatus.value?.configured}
+        <button
+          class="btn-icon"
+          title="Sync with Cloudflare"
+          aria-label="Sync tunnels"
+          onclick={syncTunnels}>⟳</button
+        >
+      {/if}
+      <button
+        class="btn-icon"
+        title="New tunnel"
+        aria-label="New tunnel"
+        onclick={() => (showAddModal = true)}>+</button
+      >
+    </div>
   </div>
+
+  {#if cloudflareStatus.value?.configured}
+    <CloudflareStatus status={cloudflareStatus.value} />
+  {/if}
 
   <div class="tunnel-list">
     {#each tunnels as t (t.name)}
@@ -39,6 +70,8 @@
         tunnel={t}
         selected={selectedTunnelName === t.name}
         onclick={() => selectTunnel(t.name)}
+        onedit={() => openEdit(t)}
+        ondelete={() => openDelete(t.name)}
       />
     {/each}
   </div>
@@ -69,6 +102,12 @@
     font-size: 13px;
     color: var(--green);
     letter-spacing: 0.12em;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 4px;
+    align-items: center;
   }
 
   .btn-icon {

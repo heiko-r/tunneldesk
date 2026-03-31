@@ -52,12 +52,7 @@
 
   function clearRequests() {
     updateRequests(selectedTunnel.name, []);
-    // TODO: Clear on server
     selectedRequestId = null;
-  }
-
-  function toggleTunnel() {
-    selectedTunnel.active = !selectedTunnel.active;
   }
 
   function selectRequest(id: string) {
@@ -66,12 +61,7 @@
   }
 </script>
 
-<TunnelHeader
-  tunnel={selectedTunnel}
-  requests={tunnelRequests}
-  onclear={clearRequests}
-  ontoggle={toggleTunnel}
-/>
+<TunnelHeader tunnel={selectedTunnel} requests={tunnelRequests} onclear={clearRequests} />
 
 <div class="pane-split" class:has-detail={!!selectedRequest}>
   <div class="req-pane">

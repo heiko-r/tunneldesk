@@ -13,8 +13,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::config::Config;
+use crate::cloudflared::CloudflaredService;
+use crate::config::{Config, TunnelConfig};
 use crate::storage::{QueryFilter, WebSocketMessageFilter};
+use crate::sync::TunnelSync;
+use crate::tunnel::TunnelManager;
 
 /// A [`RequestExchange`](crate::storage::RequestExchange) with binary fields
 /// base64-encoded for safe JSON transport to the browser.
@@ -74,17 +77,54 @@ pub struct StoredWebSocketMessageWithBase64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WebSocketMessage {
+    // --- Query / subscribe ---
     ListTunnels,
     QueryRequests(QueryFilter),
     QueryWebSocketMessages(WebSocketMessageFilter),
     Subscribe(QueryFilter),
     Unsubscribe,
+    // --- Tunnel CRUD ---
+    CreateTunnel(CreateTunnelRequest),
+    UpdateTunnel(UpdateTunnelRequest),
+    DeleteTunnel(DeleteTunnelRequest),
+    // --- Cloudflare management ---
+    SyncTunnels,
+    ConfirmRemoveHosts(ConfirmRemoveHostsRequest),
+    GetCloudflareStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTunnelRequest {
+    pub name: String,
+    pub domain: String,
+    pub socket_path: Option<String>,
+    pub target_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTunnelRequest {
+    pub name: String,
+    pub domain: Option<String>,
+    pub socket_path: Option<String>,
+    pub target_port: Option<u16>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteTunnelRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfirmRemoveHostsRequest {
+    pub hosts: Vec<String>,
 }
 
 /// Responses sent by the server over the GUI WebSocket connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WebSocketResponse {
+    // --- Query responses ---
     Tunnels(Vec<TunnelInfo>),
     Requests(Vec<RequestExchangeWithBase64>),
     WebSocketMessages(Vec<StoredWebSocketMessageWithBase64>),
@@ -92,10 +132,19 @@ pub enum WebSocketResponse {
     NewRequest(Box<RequestExchangeWithBase64>),
     /// Push notification for a newly stored WebSocket frame.
     NewWebSocketMessage(Box<StoredWebSocketMessageWithBase64>),
+    // --- CRUD responses ---
+    TunnelCreated(TunnelInfo),
+    TunnelUpdated(TunnelInfo),
+    TunnelDeleted(TunnelDeletedResponse),
+    // --- Cloudflare management responses ---
+    SyncReport(SyncReportResponse),
+    /// Hosts found on Cloudflare but absent from local config; requires user confirmation.
+    UnknownHostsFound(UnknownHostsFoundResponse),
+    CloudflareStatus(CloudflareStatusResponse),
     Error(String),
 }
 
-/// Metadata about a configured tunnel, sent to the browser in a [`WebSocketResponse::Tunnels`] message.
+/// Metadata about a configured tunnel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelInfo {
     pub name: String,
@@ -103,12 +152,42 @@ pub struct TunnelInfo {
     pub socket_path: String,
     /// Local TCP port the tunnel forwards to.
     pub destination: u16,
+    /// Whether this tunnel is enabled in Cloudflare.
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelDeletedResponse {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReportResponse {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub unknown_hosts: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnknownHostsFoundResponse {
+    pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudflareStatusResponse {
+    pub configured: bool,
+    pub tunnel_id: Option<String>,
+    pub tunnel_name: Option<String>,
+    pub service_running: bool,
 }
 
 /// Serves the static web UI and handles GUI WebSocket connections.
 #[derive(Clone)]
 pub struct WebServer {
-    config: Config,
+    config: Arc<RwLock<Config>>,
+    tunnel_manager: Arc<TunnelManager>,
+    tunnel_sync: Option<Arc<TunnelSync>>,
     request_storage: Arc<crate::storage::RequestStorage>,
     websocket_storage: Arc<crate::storage::WebSocketMessageStorage>,
     current_filter: Arc<RwLock<Option<QueryFilter>>>,
@@ -116,14 +195,18 @@ pub struct WebServer {
 }
 
 impl WebServer {
-    /// Creates a new `WebServer` using `config` and the shared storage instances.
+    /// Creates a new `WebServer`.
     pub fn new(
-        config: Config,
+        config: Arc<RwLock<Config>>,
+        tunnel_manager: Arc<TunnelManager>,
+        tunnel_sync: Option<Arc<TunnelSync>>,
         request_storage: Arc<crate::storage::RequestStorage>,
         websocket_storage: Arc<crate::storage::WebSocketMessageStorage>,
     ) -> Self {
         Self {
             config,
+            tunnel_manager,
+            tunnel_sync,
             request_storage,
             websocket_storage,
             current_filter: Arc::new(RwLock::new(None)),
@@ -132,7 +215,6 @@ impl WebServer {
     }
 
     /// Binds to the configured port and serves the web UI and WebSocket API.
-    /// Returns an error if the TCP listener cannot be bound.
     pub async fn start(&self) -> anyhow::Result<()> {
         let app = Router::new()
             .route("/ws", get(websocket_handler))
@@ -142,7 +224,8 @@ impl WebServer {
             )
             .with_state(Arc::new(self.clone()));
 
-        let addr = format!("127.0.0.1:{}", self.config.gui.port);
+        let port = self.config.read().await.gui.port;
+        let addr = format!("127.0.0.1:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 
         tracing::info!("Web GUI server listening on http://{}", addr);
@@ -151,19 +234,11 @@ impl WebServer {
         Ok(())
     }
 
-    async fn handle_list_tunnels(&self) -> WebSocketResponse {
-        let tunnels: Vec<TunnelInfo> = self
-            .config
-            .tunnels
-            .iter()
-            .map(|t| TunnelInfo {
-                name: t.name.clone(),
-                domain: t.domain.clone(),
-                socket_path: t.socket_path.clone(),
-                destination: t.target_port,
-            })
-            .collect();
+    // ── Query handlers ────────────────────────────────────────────────────────
 
+    async fn handle_list_tunnels(&self) -> WebSocketResponse {
+        let cfg = self.config.read().await;
+        let tunnels = cfg.tunnels.iter().map(tunnel_info_from_config).collect();
         WebSocketResponse::Tunnels(tunnels)
     }
 
@@ -186,13 +261,269 @@ impl WebServer {
 
     async fn handle_subscribe(&self, filter: QueryFilter) -> WebSocketResponse {
         *self.current_filter.write().await = Some(filter);
-        WebSocketResponse::Requests(vec![]) // Empty response, subscription confirmed
+        WebSocketResponse::Requests(vec![])
     }
 
     async fn handle_unsubscribe(&self) -> WebSocketResponse {
         *self.current_filter.write().await = None;
         *self.current_ws_filter.write().await = None;
-        WebSocketResponse::Requests(vec![]) // Empty response, unsubscription confirmed
+        WebSocketResponse::Requests(vec![])
+    }
+
+    // ── CRUD handlers ─────────────────────────────────────────────────────────
+
+    async fn handle_create_tunnel(&self, req: CreateTunnelRequest) -> WebSocketResponse {
+        // Validate uniqueness.
+        {
+            let cfg = self.config.read().await;
+            if cfg.tunnels.iter().any(|t| t.name == req.name) {
+                return WebSocketResponse::Error(format!(
+                    "A tunnel named '{}' already exists",
+                    req.name
+                ));
+            }
+        }
+
+        let socket_path = req
+            .socket_path
+            .unwrap_or_else(|| format!("/tmp/tunneldesk-{}.sock", req.name));
+
+        let new_tunnel = TunnelConfig {
+            name: req.name.clone(),
+            domain: req.domain,
+            socket_path,
+            target_port: req.target_port,
+            enabled: true,
+        };
+
+        let info = tunnel_info_from_config(&new_tunnel);
+
+        // Persist to config.
+        let config_path = {
+            let mut cfg = self.config.write().await;
+            cfg.tunnels.push(new_tunnel.clone());
+            cfg.config_path.clone()
+        };
+
+        if let Some(path) = &config_path {
+            let cfg = self.config.read().await;
+            if let Err(e) = cfg.save_to_file(path) {
+                return WebSocketResponse::Error(format!("Failed to save config: {e}"));
+            }
+        }
+
+        // Cloudflare: add ingress rule + DNS.
+        if new_tunnel.enabled
+            && let Some(sync) = &self.tunnel_sync
+            && let Err(e) = sync.add_single_tunnel(&new_tunnel).await
+        {
+            tracing::warn!("Cloudflare add_single_tunnel failed: {e}");
+        }
+
+        // Start local proxy.
+        self.tunnel_manager.start_tunnel(new_tunnel).await;
+
+        WebSocketResponse::TunnelCreated(info)
+    }
+
+    async fn handle_update_tunnel(&self, req: UpdateTunnelRequest) -> WebSocketResponse {
+        let old_tunnel = {
+            let cfg = self.config.read().await;
+            match cfg.tunnels.iter().find(|t| t.name == req.name) {
+                Some(t) => t.clone(),
+                None => {
+                    return WebSocketResponse::Error(format!("Tunnel '{}' not found", req.name));
+                }
+            }
+        };
+
+        let old_domain = old_tunnel.domain.clone();
+        let old_enabled = old_tunnel.enabled;
+
+        let updated = TunnelConfig {
+            name: old_tunnel.name.clone(),
+            domain: req.domain.unwrap_or(old_tunnel.domain),
+            socket_path: req.socket_path.unwrap_or(old_tunnel.socket_path),
+            target_port: req.target_port.unwrap_or(old_tunnel.target_port),
+            enabled: req.enabled.unwrap_or(old_tunnel.enabled),
+        };
+
+        let info = tunnel_info_from_config(&updated);
+
+        // Persist.
+        let config_path = {
+            let mut cfg = self.config.write().await;
+            if let Some(t) = cfg.tunnels.iter_mut().find(|t| t.name == req.name) {
+                *t = updated.clone();
+            }
+            cfg.config_path.clone()
+        };
+
+        if let Some(path) = &config_path {
+            let cfg = self.config.read().await;
+            if let Err(e) = cfg.save_to_file(path) {
+                return WebSocketResponse::Error(format!("Failed to save config: {e}"));
+            }
+        }
+
+        // Cloudflare sync.
+        if let Some(sync) = &self.tunnel_sync {
+            let enabled_changed = updated.enabled != old_enabled;
+            let domain_changed = updated.domain != old_domain;
+
+            if enabled_changed && !updated.enabled {
+                // Disabled: remove from Cloudflare.
+                if let Err(e) = sync.remove_single_tunnel(&old_domain).await {
+                    tracing::warn!("Cloudflare remove_single_tunnel failed: {e}");
+                }
+            } else if enabled_changed && updated.enabled {
+                // Re-enabled: add to Cloudflare.
+                if let Err(e) = sync.add_single_tunnel(&updated).await {
+                    tracing::warn!("Cloudflare add_single_tunnel failed: {e}");
+                }
+            } else if updated.enabled && domain_changed {
+                // Domain changed while enabled: update ingress + DNS.
+                if let Err(e) = sync.update_single_tunnel(&old_domain, &updated).await {
+                    tracing::warn!("Cloudflare update_single_tunnel failed: {e}");
+                }
+            }
+        }
+
+        if old_tunnel.enabled && !updated.enabled {
+            self.tunnel_manager.stop_tunnel(&req.name).await;
+        } else {
+            self.tunnel_manager.restart_tunnel(&req.name, updated).await;
+        }
+
+        WebSocketResponse::TunnelUpdated(info)
+    }
+
+    async fn handle_delete_tunnel(&self, req: DeleteTunnelRequest) -> WebSocketResponse {
+        let tunnel = {
+            let cfg = self.config.read().await;
+            match cfg.tunnels.iter().find(|t| t.name == req.name) {
+                Some(t) => t.clone(),
+                None => {
+                    return WebSocketResponse::Error(format!("Tunnel '{}' not found", req.name));
+                }
+            }
+        };
+
+        // Persist removal.
+        let config_path = {
+            let mut cfg = self.config.write().await;
+            cfg.tunnels.retain(|t| t.name != req.name);
+            cfg.config_path.clone()
+        };
+
+        if let Some(path) = &config_path {
+            let cfg = self.config.read().await;
+            if let Err(e) = cfg.save_to_file(path) {
+                return WebSocketResponse::Error(format!("Failed to save config: {e}"));
+            }
+        }
+
+        // Cloudflare: remove ingress + DNS.
+        if tunnel.enabled
+            && let Some(sync) = &self.tunnel_sync
+            && let Err(e) = sync.remove_single_tunnel(&tunnel.domain).await
+        {
+            tracing::warn!("Cloudflare remove_single_tunnel failed: {e}");
+        }
+
+        // Stop local proxy.
+        self.tunnel_manager.stop_tunnel(&req.name).await;
+
+        WebSocketResponse::TunnelDeleted(TunnelDeletedResponse { name: req.name })
+    }
+
+    // ── Cloudflare management handlers ───────────────────────────────────────
+
+    async fn handle_sync_tunnels(&self) -> WebSocketResponse {
+        let sync = match &self.tunnel_sync {
+            Some(s) => s.clone(),
+            None => {
+                return WebSocketResponse::Error(
+                    "Cloudflare integration is not configured".to_string(),
+                );
+            }
+        };
+
+        let cfg = self.config.read().await;
+        let report = sync.sync_to_cloudflare(&cfg).await;
+        drop(cfg);
+
+        let unknown = report.unknown_hosts.clone();
+        let resp = SyncReportResponse {
+            added: report.added,
+            removed: report.removed,
+            unknown_hosts: report.unknown_hosts,
+            errors: report.errors,
+        };
+
+        // If there are unknown hosts, also emit an UnknownHostsFound message.
+        // The handler sends only one response per message, so we embed the
+        // unknown-hosts info inside the SyncReport and let the frontend decide.
+        let _ = unknown;
+
+        WebSocketResponse::SyncReport(resp)
+    }
+
+    async fn handle_confirm_remove_hosts(
+        &self,
+        req: ConfirmRemoveHostsRequest,
+    ) -> WebSocketResponse {
+        let sync = match &self.tunnel_sync {
+            Some(s) => s.clone(),
+            None => {
+                return WebSocketResponse::Error(
+                    "Cloudflare integration is not configured".to_string(),
+                );
+            }
+        };
+
+        match sync.remove_hosts(&req.hosts).await {
+            Ok(removed) => WebSocketResponse::SyncReport(SyncReportResponse {
+                added: vec![],
+                removed,
+                unknown_hosts: vec![],
+                errors: vec![],
+            }),
+            Err(e) => WebSocketResponse::Error(format!("Failed to remove hosts: {e}")),
+        }
+    }
+
+    async fn handle_get_cloudflare_status(&self) -> WebSocketResponse {
+        let (configured, tunnel_id, tunnel_name) = {
+            let cfg = self.config.read().await;
+            match &cfg.cloudflare {
+                Some(cf) => (true, cf.tunnel_id.clone(), Some(cf.tunnel_name.clone())),
+                None => (false, None, None),
+            }
+        };
+
+        let service_running = if configured {
+            CloudflaredService::is_running().await
+        } else {
+            false
+        };
+
+        WebSocketResponse::CloudflareStatus(CloudflareStatusResponse {
+            configured,
+            tunnel_id,
+            tunnel_name,
+            service_running,
+        })
+    }
+}
+
+fn tunnel_info_from_config(t: &TunnelConfig) -> TunnelInfo {
+    TunnelInfo {
+        name: t.name.clone(),
+        domain: t.domain.clone(),
+        socket_path: t.socket_path.clone(),
+        destination: t.target_port,
+        enabled: t.enabled,
     }
 }
 
@@ -226,11 +557,31 @@ async fn websocket_connection(mut socket: axum::extract::ws::WebSocket, server: 
                                         server.handle_subscribe(filter).await
                                     }
                                     WebSocketMessage::Unsubscribe => server.handle_unsubscribe().await,
+                                    WebSocketMessage::CreateTunnel(req) => {
+                                        server.handle_create_tunnel(req).await
+                                    }
+                                    WebSocketMessage::UpdateTunnel(req) => {
+                                        server.handle_update_tunnel(req).await
+                                    }
+                                    WebSocketMessage::DeleteTunnel(req) => {
+                                        server.handle_delete_tunnel(req).await
+                                    }
+                                    WebSocketMessage::SyncTunnels => {
+                                        server.handle_sync_tunnels().await
+                                    }
+                                    WebSocketMessage::ConfirmRemoveHosts(req) => {
+                                        server.handle_confirm_remove_hosts(req).await
+                                    }
+                                    WebSocketMessage::GetCloudflareStatus => {
+                                        server.handle_get_cloudflare_status().await
+                                    }
                                 };
 
                                 if let Ok(response_text) = serde_json::to_string(&response) {
                                     let _ = socket.send(Message::Text(response_text)).await;
                                 }
+                            } else {
+                                tracing::warn!("Could not parse WebSocket message: {text}");
                             }
                         }
                         Message::Binary(binary) => {
@@ -273,7 +624,6 @@ async fn websocket_connection(mut socket: axum::extract::ws::WebSocket, server: 
     }
 }
 
-// Helper function to convert StoredRequest to StoredRequestWithBase64
 fn request_to_base64(request: &crate::storage::StoredRequest) -> StoredRequestWithBase64 {
     StoredRequestWithBase64 {
         id: request.id.clone(),
@@ -287,7 +637,6 @@ fn request_to_base64(request: &crate::storage::StoredRequest) -> StoredRequestWi
     }
 }
 
-// Helper function to convert StoredResponse to StoredResponseWithBase64
 fn response_to_base64(response: &crate::storage::StoredResponse) -> StoredResponseWithBase64 {
     StoredResponseWithBase64 {
         request_id: response.request_id.clone(),
@@ -300,7 +649,6 @@ fn response_to_base64(response: &crate::storage::StoredResponse) -> StoredRespon
     }
 }
 
-// Helper function to convert RequestExchange to RequestExchangeWithBase64
 fn exchange_to_base64(exchange: &crate::storage::RequestExchange) -> RequestExchangeWithBase64 {
     RequestExchangeWithBase64 {
         request: request_to_base64(&exchange.request),
@@ -308,7 +656,6 @@ fn exchange_to_base64(exchange: &crate::storage::RequestExchange) -> RequestExch
     }
 }
 
-// Helper function to convert StoredWebSocketMessage to StoredWebSocketMessageWithBase64
 fn websocket_message_to_base64(
     message: &crate::storage::StoredWebSocketMessage,
 ) -> StoredWebSocketMessageWithBase64 {
@@ -341,12 +688,14 @@ mod tests {
                     domain: "a.example.com".to_string(),
                     socket_path: "/tmp/a.sock".to_string(),
                     target_port: 3000,
+                    enabled: true,
                 },
                 TunnelConfig {
                     name: "tunnel-b".to_string(),
                     domain: "b.example.com".to_string(),
                     socket_path: "/tmp/b.sock".to_string(),
                     target_port: 3001,
+                    enabled: true,
                 },
             ],
             logging: LoggingConfig {
@@ -358,15 +707,21 @@ mod tests {
                 max_request_body_size: 1024 * 1024,
             },
             gui: GuiConfig { port: 8080 },
+            cloudflare: None,
+            config_path: None,
         }
     }
 
     fn make_web_server() -> WebServer {
-        WebServer::new(
-            make_config(),
-            Arc::new(RequestStorage::new(100)),
-            Arc::new(WebSocketMessageStorage::new(1000)),
-        )
+        let config = Arc::new(RwLock::new(make_config()));
+        let req_storage = Arc::new(RequestStorage::new(100));
+        let ws_storage = Arc::new(WebSocketMessageStorage::new(1000));
+        let tm = Arc::new(TunnelManager::new(
+            &make_config(),
+            req_storage.clone(),
+            ws_storage.clone(),
+        ));
+        WebServer::new(config, tm, None, req_storage, ws_storage)
     }
 
     fn make_stored_request(id: &str, tunnel: &str, method: &str, url: &str) -> StoredRequest {
@@ -501,6 +856,7 @@ mod tests {
         assert_eq!(tunnels[0].name, "tunnel-a");
         assert_eq!(tunnels[0].domain, "a.example.com");
         assert_eq!(tunnels[0].destination, 3000);
+        assert!(tunnels[0].enabled);
         assert_eq!(tunnels[1].name, "tunnel-b");
         assert_eq!(tunnels[1].destination, 3001);
     }
@@ -509,9 +865,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_query_requests_returns_matching() {
+        let config = Arc::new(RwLock::new(make_config()));
         let req_storage = Arc::new(RequestStorage::new(100));
         let ws_storage = Arc::new(WebSocketMessageStorage::new(100));
-        let server = WebServer::new(make_config(), req_storage.clone(), ws_storage);
+        let tm = Arc::new(TunnelManager::new(
+            &make_config(),
+            req_storage.clone(),
+            ws_storage.clone(),
+        ));
+        let server = WebServer::new(config, tm, None, req_storage.clone(), ws_storage);
 
         let req = make_stored_request("r1", "tunnel-a", "GET", "/api");
         req_storage.store_request(req).await;
@@ -543,6 +905,230 @@ mod tests {
             panic!("expected Requests variant");
         };
         assert!(exchanges.is_empty());
+    }
+
+    // --- handle_create_tunnel ---
+
+    #[tokio::test]
+    async fn test_handle_create_tunnel_adds_tunnel() {
+        let server = make_web_server();
+        let req = CreateTunnelRequest {
+            name: "new-tunnel".to_string(),
+            domain: "new.example.com".to_string(),
+            socket_path: Some("/tmp/new.sock".to_string()),
+            target_port: 9999,
+        };
+        let response = server.handle_create_tunnel(req).await;
+
+        let WebSocketResponse::TunnelCreated(info) = response else {
+            panic!("expected TunnelCreated, got {:?}", response);
+        };
+        assert_eq!(info.name, "new-tunnel");
+        assert_eq!(info.domain, "new.example.com");
+        assert_eq!(info.destination, 9999);
+        assert!(info.enabled);
+
+        // Config must contain the new tunnel.
+        let cfg = server.config.read().await;
+        assert_eq!(cfg.tunnels.len(), 3);
+        assert!(cfg.tunnels.iter().any(|t| t.name == "new-tunnel"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_create_tunnel_rejects_duplicate_name() {
+        let server = make_web_server();
+        let req = CreateTunnelRequest {
+            name: "tunnel-a".to_string(), // already exists
+            domain: "other.example.com".to_string(),
+            socket_path: None,
+            target_port: 7777,
+        };
+        let response = server.handle_create_tunnel(req).await;
+        assert!(matches!(response, WebSocketResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_create_tunnel_generates_socket_path() {
+        let server = make_web_server();
+        let req = CreateTunnelRequest {
+            name: "auto-path".to_string(),
+            domain: "auto.example.com".to_string(),
+            socket_path: None, // should be auto-generated
+            target_port: 5555,
+        };
+        let response = server.handle_create_tunnel(req).await;
+        assert!(matches!(response, WebSocketResponse::TunnelCreated(_)));
+
+        let cfg = server.config.read().await;
+        let t = cfg.tunnels.iter().find(|t| t.name == "auto-path").unwrap();
+        assert_eq!(t.socket_path, "/tmp/tunneldesk-auto-path.sock");
+    }
+
+    // --- handle_update_tunnel ---
+
+    #[tokio::test]
+    async fn test_handle_update_tunnel_changes_domain() {
+        let server = make_web_server();
+        let req = UpdateTunnelRequest {
+            name: "tunnel-a".to_string(),
+            domain: Some("updated.example.com".to_string()),
+            socket_path: None,
+            target_port: None,
+            enabled: None,
+        };
+        let response = server.handle_update_tunnel(req).await;
+
+        let WebSocketResponse::TunnelUpdated(info) = response else {
+            panic!("expected TunnelUpdated, got {:?}", response);
+        };
+        assert_eq!(info.domain, "updated.example.com");
+
+        let cfg = server.config.read().await;
+        let t = cfg.tunnels.iter().find(|t| t.name == "tunnel-a").unwrap();
+        assert_eq!(t.domain, "updated.example.com");
+    }
+
+    #[tokio::test]
+    async fn test_handle_update_tunnel_disables_tunnel() {
+        let config = Arc::new(RwLock::new(make_config()));
+        let req_storage = Arc::new(RequestStorage::new(100));
+        let ws_storage = Arc::new(WebSocketMessageStorage::new(1000));
+        let tm = Arc::new(TunnelManager::new(
+            &make_config(),
+            req_storage.clone(),
+            ws_storage.clone(),
+        ));
+        let server = WebServer::new(config, tm.clone(), None, req_storage, ws_storage);
+
+        // Seed tunnel-a so it has a live handle; disabling should stop it.
+        let tunnel_a = make_config()
+            .tunnels
+            .into_iter()
+            .find(|t| t.name == "tunnel-a")
+            .unwrap();
+        tm.start_tunnel(tunnel_a).await;
+        assert!(tm.is_tunnel_running("tunnel-a").await);
+
+        let req = UpdateTunnelRequest {
+            name: "tunnel-a".to_string(),
+            domain: None,
+            socket_path: None,
+            target_port: None,
+            enabled: Some(false),
+        };
+        let response = server.handle_update_tunnel(req).await;
+
+        let WebSocketResponse::TunnelUpdated(info) = response else {
+            panic!("expected TunnelUpdated, got {:?}", response);
+        };
+        assert_eq!(info.enabled, false);
+
+        let cfg = server.config.read().await;
+        let t = cfg.tunnels.iter().find(|t| t.name == "tunnel-a").unwrap();
+        assert_eq!(t.enabled, false);
+
+        // stop_tunnel must have been called (not restart_tunnel, which would
+        // re-add the handle).
+        assert!(!tm.is_tunnel_running("tunnel-a").await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_update_tunnel_not_found() {
+        let server = make_web_server();
+        let req = UpdateTunnelRequest {
+            name: "ghost".to_string(),
+            domain: None,
+            socket_path: None,
+            target_port: None,
+            enabled: None,
+        };
+        let response = server.handle_update_tunnel(req).await;
+        assert!(matches!(response, WebSocketResponse::Error(_)));
+    }
+
+    // --- handle_delete_tunnel ---
+
+    #[tokio::test]
+    async fn test_handle_delete_tunnel_removes_tunnel() {
+        let server = make_web_server();
+        let req = DeleteTunnelRequest {
+            name: "tunnel-a".to_string(),
+        };
+        let response = server.handle_delete_tunnel(req).await;
+
+        let WebSocketResponse::TunnelDeleted(resp) = response else {
+            panic!("expected TunnelDeleted, got {:?}", response);
+        };
+        assert_eq!(resp.name, "tunnel-a");
+
+        let cfg = server.config.read().await;
+        assert_eq!(cfg.tunnels.len(), 1);
+        assert!(cfg.tunnels.iter().all(|t| t.name != "tunnel-a"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_tunnel_not_found() {
+        let server = make_web_server();
+        let req = DeleteTunnelRequest {
+            name: "ghost".to_string(),
+        };
+        let response = server.handle_delete_tunnel(req).await;
+        assert!(matches!(response, WebSocketResponse::Error(_)));
+    }
+
+    // --- handle_get_cloudflare_status ---
+
+    #[tokio::test]
+    async fn test_handle_get_cloudflare_status_not_configured() {
+        let server = make_web_server();
+        let response = server.handle_get_cloudflare_status().await;
+
+        let WebSocketResponse::CloudflareStatus(status) = response else {
+            panic!("expected CloudflareStatus");
+        };
+        assert!(!status.configured);
+        assert!(status.tunnel_id.is_none());
+        assert!(!status.service_running);
+    }
+
+    #[tokio::test]
+    async fn test_handle_get_cloudflare_status_configured() {
+        let mut cfg = make_config();
+        cfg.cloudflare = Some(crate::config::CloudflareConfig {
+            api_token: "tok".to_string(),
+            account_id: "acc".to_string(),
+            zone_id: "zone".to_string(),
+            tunnel_id: Some("tid-123".to_string()),
+            tunnel_name: "myapp".to_string(),
+            tunnel_token: Some("token".to_string()),
+        });
+
+        let config = Arc::new(RwLock::new(cfg.clone()));
+        let req_storage = Arc::new(RequestStorage::new(100));
+        let ws_storage = Arc::new(WebSocketMessageStorage::new(100));
+        let tm = Arc::new(TunnelManager::new(
+            &cfg,
+            req_storage.clone(),
+            ws_storage.clone(),
+        ));
+        let server = WebServer::new(config, tm, None, req_storage, ws_storage);
+
+        let response = server.handle_get_cloudflare_status().await;
+        let WebSocketResponse::CloudflareStatus(status) = response else {
+            panic!("expected CloudflareStatus");
+        };
+        assert!(status.configured);
+        assert_eq!(status.tunnel_id.as_deref(), Some("tid-123"));
+        assert_eq!(status.tunnel_name.as_deref(), Some("myapp"));
+    }
+
+    // --- handle_sync_tunnels without cloudflare ---
+
+    #[tokio::test]
+    async fn test_handle_sync_tunnels_without_cloudflare_returns_error() {
+        let server = make_web_server();
+        let response = server.handle_sync_tunnels().await;
+        assert!(matches!(response, WebSocketResponse::Error(_)));
     }
 
     // --- QueryFilter::matches (via storage) ---
@@ -626,7 +1212,6 @@ mod tests {
             status: Some(StatusFilter::Exact(200)),
             ..Default::default()
         };
-        // No response → must not match when status filter is set.
         assert!(!filter.matches(&exchange_no_resp));
 
         let exchange_with_resp = crate::storage::RequestExchange {
@@ -666,5 +1251,45 @@ mod tests {
             ..Default::default()
         };
         assert!(!too_early.matches(&exchange));
+    }
+
+    // --- WebSocket message JSON serialization ---
+
+    #[test]
+    fn test_ws_message_create_tunnel_serialization() {
+        let msg = WebSocketMessage::CreateTunnel(CreateTunnelRequest {
+            name: "my-tunnel".to_string(),
+            domain: "my.example.com".to_string(),
+            socket_path: None,
+            target_port: 8080,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"CreateTunnel\""));
+        assert!(json.contains("\"name\":\"my-tunnel\""));
+    }
+
+    #[test]
+    fn test_ws_message_update_tunnel_deserialization() {
+        let json = r#"{"type":"UpdateTunnel","data":{"name":"t","enabled":false}}"#;
+        let msg: WebSocketMessage = serde_json::from_str(json).unwrap();
+        let WebSocketMessage::UpdateTunnel(req) = msg else {
+            panic!("expected UpdateTunnel");
+        };
+        assert_eq!(req.name, "t");
+        assert_eq!(req.enabled, Some(false));
+        assert!(req.domain.is_none());
+    }
+
+    #[test]
+    fn test_tunnel_info_enabled_field() {
+        let info = TunnelInfo {
+            name: "t".to_string(),
+            domain: "t.example.com".to_string(),
+            socket_path: "/tmp/t.sock".to_string(),
+            destination: 3000,
+            enabled: false,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["enabled"], false);
     }
 }
