@@ -77,12 +77,13 @@ impl CloudflaredService {
 
         #[cfg(target_os = "macos")]
         {
-            let out = Command::new("launchctl")
+            Command::new("launchctl")
                 .args(["list"])
                 .output()
                 .await
-                .unwrap_or_default();
-            String::from_utf8_lossy(&out.stdout).contains("cloudflared")
+                .map_or(false, |out| {
+                    String::from_utf8_lossy(&out.stdout).contains("cloudflared")
+                })
         }
 
         #[cfg(target_os = "windows")]
