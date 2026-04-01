@@ -1,17 +1,19 @@
 use axum::{
     Router,
+    body::Bytes,
     extract::{
         State,
         ws::{Message, WebSocketUpgrade},
     },
-    response::Response,
+    http::{Uri, header},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use base64::Engine as _;
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::cloudflared::CloudflaredService;
 use crate::config::{Config, TunnelConfig};
@@ -182,6 +184,30 @@ pub struct CloudflareStatusResponse {
     pub service_running: bool,
 }
 
+#[derive(Embed)]
+#[folder = "frontend/build"]
+struct FrontendAssets;
+
+async fn serve_frontend(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "200.html" } else { path };
+    serve_asset(path)
+        .or_else(|| serve_asset("200.html"))
+        .unwrap_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response())
+}
+
+fn serve_asset(path: &str) -> Option<Response> {
+    let content = FrontendAssets::get(path)?;
+    let mime = content.metadata.mimetype();
+    Some(
+        (
+            [(header::CONTENT_TYPE, mime)],
+            Bytes::from(content.data.into_owned()),
+        )
+            .into_response(),
+    )
+}
+
 /// Serves the static web UI and handles GUI WebSocket connections.
 #[derive(Clone)]
 pub struct WebServer {
@@ -218,10 +244,7 @@ impl WebServer {
     pub async fn start(&self) -> anyhow::Result<()> {
         let app = Router::new()
             .route("/ws", get(websocket_handler))
-            .fallback_service(
-                ServeDir::new("frontend/build")
-                    .not_found_service(ServeFile::new("frontend/build/200.html")),
-            )
+            .fallback(serve_frontend)
             .with_state(Arc::new(self.clone()));
 
         let port = self.config.read().await.gui.port;

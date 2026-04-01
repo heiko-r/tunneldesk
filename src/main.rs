@@ -8,6 +8,9 @@ mod sync;
 mod tunnel;
 mod web_server;
 
+#[cfg(feature = "gui")]
+mod gui;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,35 +27,92 @@ use sync::{SyncReport, TunnelSync};
 use tunnel::TunnelManager;
 use web_server::WebServer;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "tunneldesk")]
 #[command(about = "A local HTTP proxy with Unix domain sockets")]
 struct Args {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Run without a native GUI window (headless server mode)
+    #[arg(long)]
+    no_gui: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+impl Args {
+    /// Resolves the config path, falling back to a platform-appropriate default.
+    fn resolved_config(&self) -> PathBuf {
+        if let Some(path) = &self.config {
+            return path.clone();
+        }
+        default_config_path()
+    }
+}
+
+/// Returns the default config file path.
+///
+/// On macOS, when running inside a `.app` bundle, uses
+/// `~/Library/Application Support/TunnelDesk/config.toml` so that a
+/// double-clicked app has a persistent, writable location for its config.
+/// Everywhere else defaults to `config.toml` in the working directory.
+fn default_config_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if exe.to_string_lossy().contains(".app/Contents/MacOS/") {
+                if let Some(home) = std::env::var_os("HOME") {
+                    return PathBuf::from(home)
+                        .join("Library/Application Support/TunnelDesk/config.toml");
+                }
+            }
+        }
+    }
+    PathBuf::from("config.toml")
+}
+
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
+    #[cfg(feature = "gui")]
+    if !args.no_gui {
+        gui::launch(args); // diverges: tao event loop runs forever
+    }
+
+    tokio::runtime::Runtime::new()?.block_on(run_headless(args))
+}
+
+async fn run_headless(args: Args) -> anyhow::Result<()> {
+    let (tunnel_manager, web_server_handle, _port) = init_app(&args).await?;
+
+    tunnel_manager.wait_for_shutdown_signal().await;
+    tunnel_manager.shutdown().await;
+    web_server_handle.abort();
+
+    Ok(())
+}
+
+/// Initialises all app components and returns handles needed for lifecycle management.
+/// Returns `(tunnel_manager, web_server_handle, gui_port)`.
+pub(crate) async fn init_app(
+    args: &Args,
+) -> anyhow::Result<(Arc<TunnelManager>, tokio::task::JoinHandle<()>, u16)> {
     // Load configuration
-    let mut config = if args.config.exists() {
-        Config::from_file(&args.config)?
+    let config_path = args.resolved_config();
+    let mut config = if config_path.exists() {
+        Config::from_file(&config_path)?
     } else {
         info!("Config file not found, using default configuration");
         Config::default_config()
     };
 
     // Cloudflare setup (only when [cloudflare] section is present)
-    let tunnel_sync: Option<Arc<TunnelSync>> = setup_cloudflare(&mut config, &args.config).await;
+    let tunnel_sync: Option<Arc<TunnelSync>> = setup_cloudflare(&mut config, &config_path).await;
 
     // Wrap config in shared Arc<RwLock> for live mutation by CRUD handlers.
     let shared_config = Arc::new(RwLock::new(config));
@@ -63,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let websocket_storage = Arc::new(WebSocketMessageStorage::new(
         cfg.capture.max_stored_requests,
     ));
+    let port = cfg.gui.port;
     drop(cfg);
 
     // Create tunnel manager
@@ -95,16 +156,7 @@ async fn main() -> anyhow::Result<()> {
         tunnel_manager.start_tunnels(&cfg).await;
     }
 
-    // Wait for shutdown signal
-    tunnel_manager.wait_for_shutdown_signal().await;
-
-    // Shutdown all tunnels
-    tunnel_manager.shutdown().await;
-
-    // Abort web server
-    web_server_handle.abort();
-
-    Ok(())
+    Ok((tunnel_manager, web_server_handle, port))
 }
 
 /// Performs Cloudflare setup if `[cloudflare]` is configured.

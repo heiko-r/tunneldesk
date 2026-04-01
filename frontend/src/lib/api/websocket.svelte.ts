@@ -111,7 +111,7 @@ export const connectionState = $state({ connected: false });
 
 function connect() {
   const host = import.meta.env.DEV
-    ? `${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT}`
+    ? `${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT || 3013}`
     : window.location.host;
   const wsUrl = `ws://${host}/ws`;
   ws = new WebSocket(wsUrl);

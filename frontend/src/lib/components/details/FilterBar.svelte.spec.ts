@@ -7,24 +7,23 @@ describe("FilterBar", () => {
   it("renders method and status dropdowns and URL input", async () => {
     render(FilterBar, {
       props: {
-        filterMethod: null,
-        filterStatus: null,
+        filterMethod: "",
+        filterStatus: "",
         filterUrl: null,
         count: 10,
       },
     });
-    await expect.element(page.getByRole("combobox", { name: /method/i })).not.toBeInTheDocument();
-    // Verify both selects are present by checking for their default options
-    const selects = document.querySelectorAll("select");
-    expect(selects).toHaveLength(2);
+    const triggers = page.getByRole("button", { expanded: false });
+    await expect.element(triggers.nth(0)).toBeInTheDocument();
+    await expect.element(triggers.nth(1)).toBeInTheDocument();
     await expect.element(page.getByPlaceholder("Filter URL…")).toBeInTheDocument();
   });
 
   it("shows request count", async () => {
     render(FilterBar, {
       props: {
-        filterMethod: null,
-        filterStatus: null,
+        filterMethod: "",
+        filterStatus: "",
         filterUrl: null,
         count: 17,
       },
@@ -35,25 +34,24 @@ describe("FilterBar", () => {
   it("lists all HTTP methods in the method dropdown", async () => {
     render(FilterBar, {
       props: {
-        filterMethod: null,
-        filterStatus: null,
+        filterMethod: "",
+        filterStatus: "",
         filterUrl: null,
         count: 0,
       },
     });
-    const methodSelect = document.querySelectorAll("select")[0];
-    const options = Array.from(methodSelect.querySelectorAll("option")).map((o) => o.value);
-    expect(options).toContain("GET");
-    expect(options).toContain("POST");
-    expect(options).toContain("DELETE");
-    expect(options).toContain("PATCH");
+    // Open the method dropdown (first trigger button)
+    await page.getByRole("button", { expanded: false }).nth(0).click();
+    for (const method of ["GET", "POST", "DELETE", "PATCH"]) {
+      await expect.element(page.getByRole("option", { name: method })).toBeInTheDocument();
+    }
   });
 
   it("shows ALL METHODS and ALL STATUS as default options", async () => {
     render(FilterBar, {
       props: {
-        filterMethod: null,
-        filterStatus: null,
+        filterMethod: "",
+        filterStatus: "",
         filterUrl: null,
         count: 0,
       },

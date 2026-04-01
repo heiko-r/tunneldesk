@@ -19,12 +19,21 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 
 - Request inspection proxy: Rust, Tokio, Axum
 - Local web UI: SvelteKit as static single page application
+- Native GUI window: `wry` (system webview) + `tao` (windowing), enabled by the `gui` Cargo feature (on by default)
 - Platform: Linux, Windows, MacOS
 
 ## Architecture
 
 - `/src` contains the local proxy application in Rust
+- `/src/gui.rs` contains the native GUI window launcher (tao event loop + wry webview)
 - `/frontend` contains the local web UI in SvelteKit
+
+## GUI Feature
+
+- Default build (`cargo build`) includes a native webview window that opens automatically
+- `cargo build --no-default-features` builds a headless server only (no wry/tao dependency)
+- `--no-gui` CLI flag runs the binary in headless mode even when compiled with the `gui` feature
+- On Linux, requires system packages: `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`, `libjavascriptcoregtk-4.1-dev`, `libgtk-3-dev`
 
 ## Conventions
 
@@ -59,7 +68,7 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 - API/WebSocket client lives under `frontend/src/lib/api/` (`websocket.svelte.ts`, `mappers.ts`)
 - Global styles are in `frontend/src/app.css` (not embedded in components)
 - In production (built SPA), WebSocket URL uses `window.location.host` — backend serves UI and WS on the same port
-- In dev (`npm run dev`), WebSocket URL uses `window.location.hostname` + `VITE_BACKEND_PORT` from `.env.development` (default 8081, matching `config.toml [gui] port`)
+- In dev (`npm run dev`), WebSocket URL uses `window.location.hostname` + `VITE_BACKEND_PORT` from `.env.development` (default 3013, matching `config.toml [gui] port`)
 
 ## Frontend Testing
 

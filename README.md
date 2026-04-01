@@ -1,54 +1,73 @@
 # TunnelDesk
 
-A local HTTP proxy that forwards requests from Unix domain sockets to TCP ports with comprehensive request inspection and WebSocket support.
+A local HTTP proxy for Cloudflare Tunnels with request inspection and WebSocket support.
 
 ## Features
 
-- **Multiple Tunnels**: Configure multiple tunnels with separate Unix domain sockets
+- **Native GUI Window**: Opens a native webview window on startup — no browser required
+- **CLI mode**: Optionally run without the GUI window and access the UI via browser
+- **Multiple Tunnels**: Configure multiple tunnels, each with their own subdomain
 - **HTTP & WebSocket Support**: Forward both HTTP requests and WebSocket connections
-- **Comprehensive Request Inspection**: Captures all request/response metadata and bodies and logs them in human-readable format
-- **Configuration File**: Easy TOML-based configuration
-- **Graceful Shutdown**: Clean shutdown with Ctrl+C
+- **Request Inspection**: Captures all request/response headers and bodies in memory
+- **Cloudflare Integration**: Automatically creates and syncs tunnel configuration
+- **Configuration File**: TOML-based configuration which stays in sync with the Cloudflare Tunnel configuration
 
 ## Installation
 
+### Linux dependencies (for the native GUI window)
+
 ```bash
-cd frontend && npm run build
-cd .. && cargo build --release
+sudo apt-get install libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libgtk-3-dev
+```
+
+### Build
+
+```bash
+# Build frontend
+cd frontend && npm run build && cd ..
+
+# Build with native GUI (default)
+cargo build --release
+
+# Build headless only (no system webview required)
+cargo build --release --no-default-features
 ```
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Start with default config.toml
-cargo run
+# Start with native GUI window (default)
+./tunneldesk
 
-# Start with custom config file
-cargo run -- --config /path/to/config.toml
+# Start in headless server mode
+./tunneldesk --no-gui
+
+# Use a custom config file
+./tunneldesk --config /path/to/config.toml
 ```
 
-### Configuration
+When launched in GUI mode, TunnelDesk opens a native window showing the web UI. Closing the window shuts down the application. In headless mode the UI is accessible at `http://127.0.0.1:3013` (or the port set in `config.toml`).
+
+## Configuration
 
 Create a `config.toml` file:
 
 ```toml
 [logging]
 stdout_level = "basic"
-max_request_body_size = 1024
-
 [capture]
 max_stored_requests = 1000
 max_request_body_size = 10485760
+
+[gui]
+port = 3013
 
 [cloudflare]
 api_token = "your-api-token-here"
 account_id = "your-account-id"
 zone_id = "your-zone-id"
-tunnel_id = "your-tunnel-id" # Optional, will be populated automatically
-tunnel_name = "your-tunnel-name" # Optional, will be populated automatically
-tunnel_token = "your-tunnel-token" # Optional, will be populated automatically
+tunnel_name = "your-tunnel-name"
+# tunnel_id and tunnel_token are populated automatically on first run
 
 [[tunnels]]
 name = "webapp"
@@ -63,66 +82,24 @@ socket_path = "/tmp/api.sock"
 target_port = 3000
 ```
 
-### Making Requests
-
-Use tools like `curl` or HTTP clients that support Unix domain sockets:
-
-```bash
-# HTTP request
-curl --unix-socket /tmp/webapp.sock http://localhost/api/users
-
-# WebSocket request
-wscat -c ws://localhost/ --socket /tmp/webapp.sock
-```
-
-## Request inspection
-
-The proxy captures all traffix and logs it in human-readable format:
-
-```
-[webapp] → GET /api/users - 573 bytes
-[webapp] Headers: {user-agent: curl/7.68.0, accept: */*}
-[webapp] Body: (empty)
-
-[webapp] ← 200 - 129 bytes
-[webapp] Headers: {content-type: application/json, content-length: 42}
-[webapp] Body: {"users": [{"id": 1, "name": "Alice"}]}
-
-[webapp] WS → - opcode: 1, payload: {"type": "message", "data": "hello"}
-[webapp] WS ← - opcode: 1, payload: {"type": "response", "data": "world"}
-```
-
-## Configuration Options
-
-Each tunnel supports:
-
-- `name`: Identifier for the tunnel (used in logs)
-- `socket_path`: Path to the Unix domain socket (will be created if it doesn't exist)
-- `target_port`: TCP port to forward requests to
-
 ## Development
 
-### Proxy
-
 ```bash
-# Run in development mode
+# Run proxy (with GUI)
 cargo run
+
+# Run proxy (headless)
+cargo run -- --no-gui
 
 # Run tests
 cargo test
 
-# Build for release
-cargo build --release
-```
+# Frontend dev server (hot reload, proxies to backend on port 3013)
+source ~/.nvm/nvm.sh && nvm use 24
+cd frontend && npm run dev
 
-### Web UI
-
-```bash
-# Run in development mode (served from Vite dev server)
-npm run dev
-
-# Build for release (served from proxy app)
-npm run build
+# Build frontend for production
+cd frontend && npm run build
 ```
 
 ## License

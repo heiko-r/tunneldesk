@@ -16,22 +16,20 @@ describe("BodyPreview", () => {
 
   it("renders a view selector dropdown", async () => {
     render(BodyPreview, { props: { body: b64("hello") } });
-    const select = document.querySelector("select.view-select");
-    expect(select).not.toBeNull();
+    const trigger = document.querySelector('button[aria-haspopup="listbox"]');
+    expect(trigger).not.toBeNull();
   });
 
   it("auto-selects JSON view for application/json mime type", async () => {
     const json = b64('{"key":"value"}');
     render(BodyPreview, { props: { body: json, mimeType: "application/json" } });
-    const select = document.querySelector("select.view-select") as HTMLSelectElement;
-    expect(select.value).toBe("json");
+    await expect.element(page.getByRole("button", { name: /formatted json/i })).toBeInTheDocument();
   });
 
   it("auto-selects XML view for application/xml mime type", async () => {
     const xml = b64("<root><item>1</item></root>");
     render(BodyPreview, { props: { body: xml, mimeType: "application/xml" } });
-    const select = document.querySelector("select.view-select") as HTMLSelectElement;
-    expect(select.value).toBe("xml");
+    await expect.element(page.getByRole("button", { name: /formatted xml/i })).toBeInTheDocument();
   });
 
   it("renders formatted JSON in the code block", async () => {
@@ -68,7 +66,6 @@ describe("BodyPreview", () => {
 
   it("auto-detects JSON from content when no mime type provided", async () => {
     render(BodyPreview, { props: { body: b64('{"auto":true}') } });
-    const select = document.querySelector("select.view-select") as HTMLSelectElement;
-    expect(select.value).toBe("json");
+    await expect.element(page.getByRole("button", { name: /formatted json/i })).toBeInTheDocument();
   });
 });

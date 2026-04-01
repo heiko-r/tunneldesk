@@ -1,5 +1,15 @@
 <script lang="ts">
   import { decodeBase64, bytesToHex, bytesToUtf, formatJson, formatXml } from "$lib/utils";
+  import Select from "$lib/components/Select.svelte";
+
+  const VIEW_OPTIONS = [
+    { value: "preview", label: "Preview" },
+    { value: "json", label: "Formatted JSON" },
+    { value: "xml", label: "Formatted XML" },
+    { value: "utf", label: "Raw UTF-8" },
+    { value: "hex", label: "Raw Hex" },
+    { value: "base64", label: "Raw Base64" },
+  ];
 
   let {
     body,
@@ -11,7 +21,7 @@
 
   type ViewType = "preview" | "json" | "xml" | "utf" | "hex" | "base64";
 
-  let selectedView: ViewType | null = $derived(autoSelectView(mimeType));
+  let selectedView: ViewType = $derived(autoSelectView(mimeType));
 
   /** Derives the best default view based on MIME type or body content. */
   function autoSelectView(mime: string | undefined): ViewType {
@@ -62,14 +72,7 @@
 {#if content}
   <div class="body-preview">
     <div class="view-selector">
-      <select bind:value={selectedView} class="view-select">
-        <option value="preview">Preview</option>
-        <option value="json">Formatted JSON</option>
-        <option value="xml">Formatted XML</option>
-        <option value="utf">Raw UTF-8</option>
-        <option value="hex">Raw Hex</option>
-        <option value="base64">Raw Base64</option>
-      </select>
+      <Select bind:value={selectedView} options={VIEW_OPTIONS} />
     </div>
 
     <div class="content-display">
@@ -108,25 +111,6 @@
     display: flex;
     justify-content: flex-end;
     margin-bottom: 4px;
-  }
-
-  .view-select {
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    color: var(--text);
-    font-family: "JetBrains Mono", monospace;
-    font-size: 10px;
-    padding: 4px 8px;
-    cursor: pointer;
-  }
-  .view-select:hover {
-    border-color: var(--green);
-  }
-  .view-select:focus {
-    outline: none;
-    border-color: var(--green);
-    box-shadow: 0 0 0 1px var(--green);
   }
 
   .content-display {

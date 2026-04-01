@@ -102,6 +102,8 @@
     font-size: 13px;
     color: var(--green);
     letter-spacing: 0.12em;
+    white-space: nowrap;
+    line-height: 1;
   }
 
   .header-actions {

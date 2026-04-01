@@ -1,5 +1,18 @@
 <script lang="ts">
-  const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] as const;
+  import Select from "$lib/components/Select.svelte";
+
+  const METHOD_OPTIONS = [
+    { value: "", label: "ALL METHODS" },
+    ...["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"].map((m) => ({
+      value: m,
+      label: m,
+    })),
+  ];
+
+  const STATUS_OPTIONS = [
+    { value: "", label: "ALL STATUS" },
+    ...[2, 3, 4, 5].map((s) => ({ value: s, label: `${s}xx` })),
+  ];
 
   let {
     filterMethod = $bindable(),
@@ -7,26 +20,16 @@
     filterUrl = $bindable(),
     count,
   }: {
-    filterMethod: string | null;
-    filterStatus: string | null;
+    filterMethod: string;
+    filterStatus: string;
     filterUrl: string | null;
     count: number;
   } = $props();
 </script>
 
 <div class="filters">
-  <select bind:value={filterMethod} class="filter-select">
-    <option value="">ALL METHODS</option>
-    {#each HTTP_METHODS as m (m)}
-      <option value={m}>{m}</option>
-    {/each}
-  </select>
-  <select bind:value={filterStatus} class="filter-select">
-    <option value="">ALL STATUS</option>
-    {#each [2, 3, 4, 5] as s (s)}
-      <option value={s}>{s}xx</option>
-    {/each}
-  </select>
+  <Select bind:value={filterMethod} options={METHOD_OPTIONS} />
+  <Select bind:value={filterStatus} options={STATUS_OPTIONS} />
   <input class="filter-input" placeholder="Filter URL…" bind:value={filterUrl} />
   <span class="req-count">{count}</span>
 </div>
@@ -42,7 +45,6 @@
     flex-shrink: 0;
   }
 
-  .filter-select,
   .filter-input {
     background: var(--bg2);
     border: 1px solid var(--border);
@@ -53,13 +55,10 @@
     border-radius: 3px;
     outline: none;
     transition: border-color 0.1s;
+    flex: 1;
   }
-  .filter-select:focus,
   .filter-input:focus {
     border-color: var(--green2);
-  }
-  .filter-input {
-    flex: 1;
   }
   .req-count {
     color: var(--dim);

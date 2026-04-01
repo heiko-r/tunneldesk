@@ -15,8 +15,8 @@
     selectedRequestId: string | null;
   } = $props();
 
-  let filterMethod: string | null = $state(null);
-  let filterStatus: string | null = $state(null);
+  let filterMethod: string = $state("");
+  let filterStatus: string = $state("");
   let filterUrl: string | null = $state(null);
   let sortField: "Timestamp" | "ResponseTime" = $state("Timestamp");
   let sortDir: "asc" | "desc" = $state("desc");

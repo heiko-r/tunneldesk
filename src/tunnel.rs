@@ -126,15 +126,23 @@ impl TunnelManager {
 
     /// Blocks until Ctrl-C or SIGTERM is received.
     pub async fn wait_for_shutdown_signal(&self) {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received Ctrl+C, shutting down...");
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C, shutting down...");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down...");
+                }
             }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down...");
-            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Received Ctrl+C, shutting down...");
         }
     }
 }
