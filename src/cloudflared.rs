@@ -88,12 +88,13 @@ impl CloudflaredService {
 
         #[cfg(target_os = "windows")]
         {
-            let out = Command::new("sc")
+            Command::new("sc")
                 .args(["query", "cloudflared"])
                 .output()
                 .await
-                .unwrap_or_default();
-            String::from_utf8_lossy(&out.stdout).contains("RUNNING")
+                .map_or(false, |out| {
+                    String::from_utf8_lossy(&out.stdout).contains("RUNNING")
+                })
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

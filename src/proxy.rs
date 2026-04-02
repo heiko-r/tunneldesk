@@ -3,9 +3,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 use crate::capture::Capture;
 use crate::config::TunnelConfig;
@@ -452,35 +455,43 @@ impl Proxy {
             std::fs::remove_file(socket_path)?;
         }
 
-        let listener = UnixListener::bind(socket_path)?;
-        info!("Tunnel '{}' listening on {}", self.config.name, socket_path);
-
-        loop {
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((stream, _)) => {
-                            let config = self.config.clone();
-                            let capture = self.capture.clone();
-                            let max_body_size = self.max_body_size;
-
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    Self::handle_connection(stream, config, capture, max_body_size)
-                                        .await
-                                {
-                                    error!("Connection error: {}", e);
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            error!("Failed to accept connection: {}", e);
+        #[cfg(unix)]
+        {
+            let listener = UnixListener::bind(socket_path)?;
+            info!("Tunnel '{}' listening on {}", self.config.name, socket_path);
+            loop {
+                tokio::select! {
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, _)) => self.spawn_connection(stream),
+                            Err(e) => error!("Failed to accept connection: {}", e),
                         }
                     }
+                    _ = cancel_token.cancelled() => {
+                        info!("Shutting down tunnel '{}'", self.config.name);
+                        break;
+                    }
                 }
-                _ = cancel_token.cancelled() => {
-                    info!("Shutting down tunnel '{}'", self.config.name);
-                    break;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let mut stream_rx = windows_accept_thread(socket_path)?;
+            info!("Tunnel '{}' listening on {}", self.config.name, socket_path);
+            loop {
+                tokio::select! {
+                    result = stream_rx.recv() => {
+                        match result {
+                            Some(Ok(stream)) => self.spawn_connection(stream),
+                            Some(Err(e)) => error!("Failed to accept connection: {}", e),
+                            None => break,
+                        }
+                    }
+                    _ = cancel_token.cancelled() => {
+                        info!("Shutting down tunnel '{}'", self.config.name);
+                        break;
+                    }
                 }
             }
         }
@@ -492,12 +503,29 @@ impl Proxy {
         Ok(())
     }
 
-    async fn handle_connection(
-        unix_stream: UnixStream,
+    fn spawn_connection<S>(&self, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        let config = self.config.clone();
+        let capture = self.capture.clone();
+        let max_body_size = self.max_body_size;
+        tokio::spawn(async move {
+            if let Err(e) = Self::handle_connection(stream, config, capture, max_body_size).await {
+                error!("Connection error: {}", e);
+            }
+        });
+    }
+
+    async fn handle_connection<S>(
+        unix_stream: S,
         config: TunnelConfig,
         capture: Capture,
         max_body_size: usize,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
         let target_addr = format!("127.0.0.1:{}", config.target_port);
         let tcp_stream = match TcpStream::connect(&target_addr).await {
             Ok(stream) => stream,
@@ -512,7 +540,7 @@ impl Proxy {
             config.name, target_addr
         );
 
-        let (unix_reader, unix_writer) = unix_stream.into_split();
+        let (unix_reader, unix_writer) = tokio::io::split(unix_stream);
         let (tcp_reader, tcp_writer) = tcp_stream.into_split();
 
         let connection_id = format!("{}-{}", config.name, uuid::Uuid::new_v4());
@@ -562,6 +590,112 @@ impl Proxy {
 
         Ok(())
     }
+}
+
+/// Spawns a background OS thread that calls `accept()` in a blocking loop and
+/// sends each accepted connection as a [`tokio::io::DuplexStream`] through the
+/// returned channel.  Dropping the receiver signals the thread to stop.
+///
+/// We use this on Windows because `tokio::net::UnixListener` is not available
+/// there (`cfg_net_unix!` is `#[cfg(all(unix, …))]`).  `socket2` supports
+/// AF_UNIX sockets on Windows 10 1803+ / Windows 11.
+#[cfg(windows)]
+fn windows_accept_thread(
+    socket_path: &str,
+) -> std::io::Result<tokio::sync::mpsc::Receiver<std::io::Result<tokio::io::DuplexStream>>> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    listener.bind(&SockAddr::unix(socket_path)?)?;
+    listener.listen(128)?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let handle = tokio::runtime::Handle::current();
+
+    std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => match windows_bridge(stream) {
+                    Ok(duplex) => {
+                        if handle.block_on(tx.send(Ok(duplex))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if handle.block_on(tx.send(Err(e))).is_err() {
+                            break;
+                        }
+                    }
+                },
+                Err(e) => {
+                    let _ = handle.block_on(tx.send(Err(e)));
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+/// Wraps a blocking [`socket2::Socket`] (an accepted AF_UNIX connection) in a
+/// [`tokio::io::DuplexStream`] so that it can be used with the generic async
+/// proxy code.
+///
+/// Two OS threads are spawned per connection:
+/// * **Thread 1** reads from the socket and writes into the async duplex end.
+/// * **Thread 2** reads from the async duplex end and writes to the socket.
+///
+/// `Handle::block_on` is called from the *OS* threads (not from within tokio),
+/// which is explicitly supported — it parks the calling thread until the async
+/// future completes, using tokio's runtime for scheduling.
+#[cfg(windows)]
+fn windows_bridge(stream: socket2::Socket) -> std::io::Result<tokio::io::DuplexStream> {
+    use std::io::{Read, Write};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client, server) = tokio::io::duplex(65536);
+    let (mut server_read, mut server_write) = tokio::io::split(server);
+
+    let read_sock = stream.try_clone()?;
+    let write_sock = stream;
+
+    let handle = tokio::runtime::Handle::current();
+
+    // Thread 1: socket → async (fills the client's read buffer)
+    let h1 = handle.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        let mut sock = read_sock;
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if h1.block_on(server_write.write_all(&buf[..n])).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Thread 2: async → socket (drains the client's write buffer)
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        let mut sock = write_sock;
+        loop {
+            match handle.block_on(server_read.read(&mut buf)) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sock.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(client)
 }
 
 #[cfg(test)]

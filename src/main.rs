@@ -60,10 +60,9 @@ impl Args {
 
 /// Returns the default config file path.
 ///
-/// On macOS, when running inside a `.app` bundle, uses
-/// `~/Library/Application Support/TunnelDesk/config.toml` so that a
-/// double-clicked app has a persistent, writable location for its config.
-/// Everywhere else defaults to `config.toml` in the working directory.
+/// - macOS `.app` bundle: `~/Library/Application Support/TunnelDesk/config.toml`
+/// - Windows: `%APPDATA%\TunnelDesk\config.toml`
+/// - Everywhere else: `config.toml` in the working directory.
 fn default_config_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -74,6 +73,14 @@ fn default_config_path() -> PathBuf {
                         .join("Library/Application Support/TunnelDesk/config.toml");
                 }
             }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata)
+                .join("TunnelDesk")
+                .join("config.toml");
         }
     }
     PathBuf::from("config.toml")
