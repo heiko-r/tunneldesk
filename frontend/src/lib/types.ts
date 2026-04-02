@@ -32,6 +32,8 @@ export type TunneledRequest = {
   requestBody: string | null;
   responseBody?: string;
   isWebSocket?: boolean;
+  /** `true` when this request was created by the replay feature. */
+  replayed?: boolean;
   wsMessages: {
     dir: "in" | "out";
     ts: Date;

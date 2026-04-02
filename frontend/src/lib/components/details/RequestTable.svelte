@@ -60,6 +60,7 @@
       >
       <span class="col-url url-cell">
         {#if req.isWebSocket}<span class="ws-badge">WS</span>{/if}
+        {#if req.replayed}<span class="replay-badge">↩</span>{/if}
         {req.url}
       </span>
       <span class="col-status"
@@ -137,5 +138,11 @@
     display: flex;
     align-items: center;
     gap: 5px;
+  }
+
+  .replay-badge {
+    font-size: 10px;
+    color: var(--blue);
+    flex-shrink: 0;
   }
 </style>

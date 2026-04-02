@@ -23,6 +23,9 @@ pub struct StoredRequest {
     pub body: Vec<u8>,
     /// Complete raw request bytes as received, potentially truncated.
     pub raw_request: Vec<u8>,
+    /// `true` when this request was created by the replay feature, not by live traffic.
+    #[serde(default)]
+    pub replayed: bool,
 }
 
 /// A captured HTTP response, stored in memory and linked to a [`StoredRequest`] by ID.
@@ -400,6 +403,34 @@ impl RequestStorage {
         Some((request_id, timestamp))
     }
 
+    /// Stores a complete request–response exchange atomically and broadcasts it.
+    ///
+    /// Used by the replay handler to record replayed requests as a single operation.
+    pub async fn store_exchange(&self, exchange: RequestExchange) {
+        let id = exchange.request.id.clone();
+        {
+            let mut requests = self.requests.write().await;
+
+            if requests.len() >= self.max_requests {
+                let mut oldest_key = None;
+                let mut oldest_timestamp = Utc::now();
+                for (key, e) in requests.iter() {
+                    if e.request.timestamp < oldest_timestamp {
+                        oldest_timestamp = e.request.timestamp;
+                        oldest_key = Some(key.clone());
+                    }
+                }
+                if let Some(key) = oldest_key {
+                    requests.remove(&key);
+                }
+            }
+
+            requests.insert(id, exchange.clone());
+        }
+
+        let _ = self.request_sender.send(exchange);
+    }
+
     /// Attaches `response` to its corresponding request exchange and broadcasts
     /// the completed exchange to all active subscribers.  Does nothing when no
     /// exchange with `response.request_id` exists.
@@ -498,6 +529,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         }
     }
 
@@ -813,6 +845,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         let req2 = StoredRequest {
@@ -824,6 +857,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         let req3 = StoredRequest {
@@ -835,6 +869,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         // Store in reverse order to test sorting
@@ -869,6 +904,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         let req2 = StoredRequest {
@@ -880,6 +916,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         let req3 = StoredRequest {
@@ -891,6 +928,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         // Store in chronological order
@@ -925,6 +963,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         let req2 = StoredRequest {
@@ -936,6 +975,7 @@ mod tests {
             headers: HashMap::new(),
             body: vec![],
             raw_request: vec![],
+            replayed: false,
         };
 
         // Store in chronological order

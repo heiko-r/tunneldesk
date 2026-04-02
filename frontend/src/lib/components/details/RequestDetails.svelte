@@ -5,16 +5,21 @@
   import BodyPreview from "$lib/components/body/BodyPreview.svelte";
   import HeadersTab from "./HeadersTab.svelte";
   import WsMessagesTab from "./WsMessagesTab.svelte";
+  import ReplayModal from "$lib/components/modal/ReplayModal.svelte";
 
   let {
     request,
     activeRequestTab = $bindable(),
     onclose,
+    onselectrequest,
   }: {
     request: TunneledRequest;
     activeRequestTab: RequestTab;
     onclose: () => void;
+    onselectrequest: (id: string) => void;
   } = $props();
+
+  let showReplayModal = $state(false);
 
   /** Returns the value of a header case-insensitively. */
   function getHeaderValue(headers: Record<string, string>, name: string): string | undefined {
@@ -41,8 +46,22 @@
     <span class="badge {methodClass(request.method)}">{request.method}</span>
     <span class="detail-url">{request.url}</span>
     <span class="status-badge {statusClass(request.status)}">{request.status ?? "—"}</span>
+    <button class="replay-btn" aria-label="Replay request" onclick={() => (showReplayModal = true)}
+      >↩ REPLAY</button
+    >
     <button class="close-btn" aria-label="Close" onclick={onclose}>✕</button>
   </div>
+
+  {#if showReplayModal}
+    <ReplayModal
+      {request}
+      onclose={() => (showReplayModal = false)}
+      onselectrequest={(id) => {
+        showReplayModal = false;
+        onselectrequest(id);
+      }}
+    />
+  {/if}
 
   <div class="detail-meta">
     <span
@@ -124,6 +143,25 @@
     text-overflow: ellipsis;
     color: var(--text);
   }
+  .replay-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--dim);
+    cursor: pointer;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    padding: 3px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+    transition: all 0.1s;
+  }
+  .replay-btn:hover {
+    color: var(--green);
+    border-color: var(--green2);
+  }
+
   .close-btn {
     background: none;
     border: none;

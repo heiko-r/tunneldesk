@@ -223,6 +223,7 @@ impl Capture {
             headers: headers.clone(),
             body,
             raw_request: raw_message.to_vec(),
+            replayed: false,
         };
 
         if is_websocket_upgrade(&headers) {

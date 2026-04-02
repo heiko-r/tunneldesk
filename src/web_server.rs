@@ -43,6 +43,8 @@ pub struct StoredRequestWithBase64 {
     pub body: String,
     /// Base64-encoded raw request bytes.
     pub raw_request: String,
+    /// `true` when this request was created by the replay feature.
+    pub replayed: bool,
 }
 
 /// A [`StoredResponse`](crate::storage::StoredResponse) with `body` and
@@ -75,6 +77,28 @@ pub struct StoredWebSocketMessageWithBase64 {
     pub payload: String,
 }
 
+/// Payload for a replay request sent by the browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayRequestPayload {
+    pub tunnel_name: String,
+    pub method: String,
+    pub url: String,
+    pub headers: std::collections::HashMap<String, String>,
+    /// Base64-encoded request body.
+    pub body: String,
+}
+
+/// Payload for a replay response sent to the browser.
+///
+/// On success `id` is the ID of the stored replayed exchange; on error `error` is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayResponsePayload {
+    /// ID of the stored replayed exchange (`None` when the request failed before storage).
+    pub id: Option<String>,
+    /// Error message when `id` is `None`.
+    pub error: Option<String>,
+}
+
 /// Commands sent by the browser over the GUI WebSocket connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -93,6 +117,8 @@ pub enum WebSocketMessage {
     SyncTunnels,
     ConfirmRemoveHosts(ConfirmRemoveHostsRequest),
     GetCloudflareStatus,
+    // --- Replay ---
+    ReplayRequest(ReplayRequestPayload),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +169,8 @@ pub enum WebSocketResponse {
     /// Hosts found on Cloudflare but absent from local config; requires user confirmation.
     UnknownHostsFound(UnknownHostsFoundResponse),
     CloudflareStatus(CloudflareStatusResponse),
+    // --- Replay ---
+    ReplayResponse(ReplayResponsePayload),
     Error(String),
 }
 
@@ -516,6 +544,123 @@ impl WebServer {
         }
     }
 
+    // ── Replay handler ────────────────────────────────────────────────────────
+
+    async fn handle_replay_request(&self, req: ReplayRequestPayload) -> WebSocketResponse {
+        macro_rules! err {
+            ($msg:expr) => {
+                return WebSocketResponse::ReplayResponse(ReplayResponsePayload {
+                    id: None,
+                    error: Some($msg),
+                })
+            };
+        }
+
+        let target_port = {
+            let cfg = self.config.read().await;
+            match cfg.tunnels.iter().find(|t| t.name == req.tunnel_name) {
+                Some(t) => t.target_port,
+                None => err!(format!("Tunnel '{}' not found", req.tunnel_name)),
+            }
+        };
+
+        let body_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.body) {
+            Ok(b) => b,
+            Err(e) => err!(format!("Invalid base64 body: {e}")),
+        };
+
+        let method = match reqwest::Method::from_bytes(req.method.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => err!(format!("Invalid HTTP method: {}", req.method)),
+        };
+
+        let full_url = format!("http://127.0.0.1:{}{}", target_port, req.url);
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        let mut request_builder = client.request(method, &full_url);
+
+        for (key, value) in &req.headers {
+            let lower = key.to_lowercase();
+            // Skip headers that reqwest or the HTTP layer manages automatically.
+            if lower == "host" || lower == "content-length" || lower == "transfer-encoding" {
+                continue;
+            }
+            if let (Ok(k), Ok(v)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                request_builder = request_builder.header(k, v);
+            }
+        }
+
+        if !body_bytes.is_empty() {
+            request_builder = request_builder.body(body_bytes.clone());
+        }
+
+        let start = std::time::Instant::now();
+
+        let response = match request_builder.send().await {
+            Ok(r) => r,
+            Err(e) => err!(format!("Request failed: {e}")),
+        };
+
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let status = response.status().as_u16();
+        let mut resp_headers = std::collections::HashMap::new();
+        for (k, v) in response.headers() {
+            if let Ok(v_str) = v.to_str() {
+                resp_headers.insert(k.to_string(), v_str.to_string());
+            }
+        }
+
+        let resp_body = match response.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => err!(format!("Failed to read response body: {e}")),
+        };
+
+        // Build the stored exchange with replayed = true.
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+
+        let stored_request = crate::storage::StoredRequest {
+            id: id.clone(),
+            timestamp: now,
+            tunnel_name: req.tunnel_name.clone(),
+            method: req.method.clone(),
+            url: req.url.clone(),
+            headers: req.headers.clone(),
+            body: body_bytes,
+            raw_request: vec![],
+            replayed: true,
+        };
+
+        let stored_response = crate::storage::StoredResponse {
+            request_id: id.clone(),
+            timestamp: now,
+            status,
+            headers: resp_headers,
+            body: resp_body,
+            raw_response: vec![],
+            response_time_ms: Some(elapsed),
+        };
+
+        let exchange = crate::storage::RequestExchange {
+            request: stored_request,
+            response: Some(stored_response),
+        };
+
+        self.request_storage.store_exchange(exchange).await;
+
+        WebSocketResponse::ReplayResponse(ReplayResponsePayload {
+            id: Some(id),
+            error: None,
+        })
+    }
+
     async fn handle_get_cloudflare_status(&self) -> WebSocketResponse {
         let (configured, tunnel_id, tunnel_name) = {
             let cfg = self.config.read().await;
@@ -598,6 +743,9 @@ async fn websocket_connection(mut socket: axum::extract::ws::WebSocket, server: 
                                     WebSocketMessage::GetCloudflareStatus => {
                                         server.handle_get_cloudflare_status().await
                                     }
+                                    WebSocketMessage::ReplayRequest(req) => {
+                                        server.handle_replay_request(req).await
+                                    }
                                 };
 
                                 if let Ok(response_text) = serde_json::to_string(&response) {
@@ -657,6 +805,7 @@ fn request_to_base64(request: &crate::storage::StoredRequest) -> StoredRequestWi
         headers: request.headers.clone(),
         body: base64::engine::general_purpose::STANDARD.encode(&request.body),
         raw_request: base64::engine::general_purpose::STANDARD.encode(&request.raw_request),
+        replayed: request.replayed,
     }
 }
 
@@ -757,6 +906,7 @@ mod tests {
             headers: HashMap::new(),
             body: b"request body".to_vec(),
             raw_request: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            replayed: false,
         }
     }
 
@@ -1143,6 +1293,101 @@ mod tests {
         assert!(status.configured);
         assert_eq!(status.tunnel_id.as_deref(), Some("tid-123"));
         assert_eq!(status.tunnel_name.as_deref(), Some("myapp"));
+    }
+
+    // --- handle_replay_request ---
+
+    #[tokio::test]
+    async fn test_handle_replay_request_tunnel_not_found() {
+        let server = make_web_server();
+        let req = ReplayRequestPayload {
+            tunnel_name: "nonexistent".to_string(),
+            method: "GET".to_string(),
+            url: "/api".to_string(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        let response = server.handle_replay_request(req).await;
+        let WebSocketResponse::ReplayResponse(payload) = response else {
+            panic!("expected ReplayResponse");
+        };
+        assert!(payload.id.is_none());
+        assert!(payload.error.unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_replay_request_invalid_base64_body() {
+        let server = make_web_server();
+        let req = ReplayRequestPayload {
+            tunnel_name: "tunnel-a".to_string(),
+            method: "POST".to_string(),
+            url: "/api".to_string(),
+            headers: HashMap::new(),
+            body: "not valid base64!!!".to_string(),
+        };
+        let response = server.handle_replay_request(req).await;
+        let WebSocketResponse::ReplayResponse(payload) = response else {
+            panic!("expected ReplayResponse");
+        };
+        assert!(payload.id.is_none());
+        assert!(payload.error.unwrap().contains("Invalid base64"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_replay_request_invalid_method() {
+        let server = make_web_server();
+        let req = ReplayRequestPayload {
+            tunnel_name: "tunnel-a".to_string(),
+            method: "NOTAMETHOD\x00".to_string(),
+            url: "/api".to_string(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        let response = server.handle_replay_request(req).await;
+        let WebSocketResponse::ReplayResponse(payload) = response else {
+            panic!("expected ReplayResponse");
+        };
+        assert!(payload.id.is_none());
+        assert!(payload.error.is_some());
+    }
+
+    #[test]
+    fn test_replay_request_payload_serialization() {
+        let payload = ReplayRequestPayload {
+            tunnel_name: "t".to_string(),
+            method: "POST".to_string(),
+            url: "/submit".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: "e30=".to_string(), // base64("{}")
+        };
+        let msg = WebSocketMessage::ReplayRequest(payload);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ReplayRequest\""));
+        assert!(json.contains("\"method\":\"POST\""));
+    }
+
+    #[test]
+    fn test_replay_response_payload_serialization_success() {
+        let payload = ReplayResponsePayload {
+            id: Some("abc-123".to_string()),
+            error: None,
+        };
+        let resp = WebSocketResponse::ReplayResponse(payload);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"ReplayResponse\""));
+        assert!(json.contains("\"id\":\"abc-123\""));
+    }
+
+    #[test]
+    fn test_replay_response_payload_serialization_error() {
+        let payload = ReplayResponsePayload {
+            id: None,
+            error: Some("Tunnel 'foo' not found".to_string()),
+        };
+        let resp = WebSocketResponse::ReplayResponse(payload);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"id\":null"));
+        assert!(json.contains("Tunnel 'foo' not found"));
     }
 
     // --- handle_sync_tunnels without cloudflare ---

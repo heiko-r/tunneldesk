@@ -4,6 +4,7 @@ import {
   addTunnel,
   addWsMessage,
   cloudflareStatus,
+  lastReplayedId,
   lastSyncReport,
   removeTunnel,
   setWsMessages,
@@ -98,6 +99,13 @@ type CloudflareStatusResponse = {
   };
 };
 
+type ReplayResponseData = {
+  id: string | null;
+  error: string | null;
+};
+
+type ReplayResponseMessage = { type: "ReplayResponse"; data: ReplayResponseData };
+
 type ErrorResponse = { type: "Error"; data: string };
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -156,6 +164,9 @@ function connect() {
           break;
         case "CloudflareStatus":
           handleCloudflareStatusMessage(message as CloudflareStatusResponse);
+          break;
+        case "ReplayResponse":
+          handleReplayResponseMessage(message as ReplayResponseMessage);
           break;
         case "Error":
           handleErrorMessage(message as ErrorResponse);
@@ -272,6 +283,12 @@ function handleCloudflareStatusMessage(message: CloudflareStatusResponse) {
   };
 }
 
+function handleReplayResponseMessage(message: ReplayResponseMessage) {
+  const d = message.data;
+  lastReplayedId.value = d.id;
+  lastReplayedId.error = d.error;
+}
+
 function handleErrorMessage(message: ErrorResponse) {
   console.error("Server error:", message.data);
 }
@@ -366,6 +383,20 @@ export function confirmRemoveHosts(hosts: string[]) {
 /** Requests the current Cloudflare integration status. */
 export function getCloudflareStatus() {
   send({ type: "GetCloudflareStatus" });
+}
+
+/** Replays an HTTP request with the given parameters. */
+export function sendReplay(
+  tunnelName: string,
+  method: string,
+  url: string,
+  headers: { [key: string]: string },
+  body: string,
+) {
+  send({
+    type: "ReplayRequest",
+    data: { tunnel_name: tunnelName, method, url, headers, body },
+  });
 }
 
 connect();

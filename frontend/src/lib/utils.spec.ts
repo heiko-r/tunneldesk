@@ -5,6 +5,7 @@ import {
   fmtTime,
   fmtMs,
   decodeBase64,
+  encodeBase64,
   bytesToHex,
   bytesToUtf,
   formatJson,
@@ -80,8 +81,10 @@ describe("fmtMs", () => {
   });
 
   it("formats milliseconds under 1s", () => {
-    expect(fmtMs(0)).toBe("0ms");
-    expect(fmtMs(250)).toBe("250ms");
+    expect(fmtMs(0)).toBe("0.000ms");
+    expect(fmtMs(0.981)).toBe("0.981ms");
+    expect(fmtMs(12.876)).toBe("12.9ms");
+    expect(fmtMs(250.432)).toBe("250ms");
     expect(fmtMs(999)).toBe("999ms");
   });
 
@@ -109,6 +112,30 @@ describe("decodeBase64", () => {
   it("returns empty Uint8Array for empty string", () => {
     const result = decodeBase64("");
     expect(result.length).toBe(0);
+  });
+});
+
+describe("encodeBase64", () => {
+  it("encodes ASCII text to base64", () => {
+    expect(encodeBase64("hello")).toBe("aGVsbG8=");
+  });
+
+  it("encodes empty string to empty base64", () => {
+    expect(encodeBase64("")).toBe("");
+  });
+
+  it("round-trips with decodeBase64", () => {
+    const original = "Hello, World! 🌍";
+    const encoded = encodeBase64(original);
+    const decoded = decodeBase64(encoded);
+    expect(bytesToUtf(decoded)).toBe(original);
+  });
+
+  it("encodes UTF-8 multibyte characters correctly", () => {
+    const result = encodeBase64("€");
+    // "€" is U+20AC, UTF-8: 0xE2 0x82 0xAC → base64: 4oysAQ== ... actually "4oKs"
+    const decoded = decodeBase64(result);
+    expect(bytesToUtf(decoded)).toBe("€");
   });
 });
 

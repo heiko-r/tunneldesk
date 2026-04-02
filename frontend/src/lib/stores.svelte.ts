@@ -14,6 +14,12 @@ export const cloudflareStatus: { value: CloudflareStatus | null } = $state({ val
 /** Latest sync report, populated by SyncReport responses. */
 export const lastSyncReport: { value: SyncReport | null } = $state({ value: null });
 
+/** ID of the most recently completed replay, populated by ReplayResponse responses. */
+export const lastReplayedId: { value: string | null; error: string | null } = $state({
+  value: null,
+  error: null,
+});
+
 type StatusFilter = { Exact: number } | { Class: number };
 type ActiveQueryFilter = {
   tunnelName: string;

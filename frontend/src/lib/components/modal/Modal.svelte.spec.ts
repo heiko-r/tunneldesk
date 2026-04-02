@@ -48,4 +48,10 @@ describe("Modal", () => {
     const dialog = page.getByRole("dialog");
     await expect.element(dialog).not.toHaveClass("modal-sm");
   });
+
+  it("applies modal-lg class when size is lg", async () => {
+    render(Modal, { props: { open: true, title: "LARGE", size: "lg", onclose: vi.fn() } });
+    const dialog = page.getByRole("dialog");
+    await expect.element(dialog).toHaveClass("modal-lg");
+  });
 });

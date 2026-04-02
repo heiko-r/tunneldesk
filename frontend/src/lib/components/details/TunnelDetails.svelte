@@ -82,6 +82,7 @@
       onclose={() => {
         selectedRequestId = null;
       }}
+      onselectrequest={selectRequest}
     />
   {/if}
 </div>

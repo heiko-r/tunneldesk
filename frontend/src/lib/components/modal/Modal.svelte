@@ -10,7 +10,7 @@
   }: {
     open: boolean;
     title: string;
-    size?: "sm";
+    size?: "sm" | "lg";
     onclose: () => void;
     children?: Snippet;
   } = $props();
@@ -27,6 +27,7 @@
     <div
       class="modal"
       class:modal-sm={size === "sm"}
+      class:modal-lg={size === "lg"}
       role="dialog"
       aria-modal="true"
       aria-labelledby="modal-title"
@@ -59,6 +60,11 @@
   }
   .modal-sm {
     width: 280px;
+  }
+  .modal-lg {
+    width: 680px;
+    max-height: 90vh;
+    overflow-y: auto;
   }
   .modal-title {
     font-family: "Syne", sans-serif;

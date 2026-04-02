@@ -8,6 +8,7 @@ type RawRequest = {
   url: string;
   headers: { [key: string]: string };
   body: string;
+  replayed?: boolean;
 };
 
 type RawResponse = {
@@ -64,6 +65,7 @@ export function mapToTunneledRequest(raw: RawRequest, response?: RawResponse): T
     responseHeaders: response?.headers,
     requestBody: raw.body,
     responseBody: response?.body,
+    replayed: raw.replayed ?? false,
     wsMessages: [],
   };
 }

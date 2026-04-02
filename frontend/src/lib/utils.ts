@@ -1,3 +1,13 @@
+/** Encodes a string to base64 using UTF-8. */
+export function encodeBase64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
 /** Decodes a base64 string to a Uint8Array. Returns an empty array on failure. */
 export function decodeBase64(base64: string): Uint8Array {
   try {
@@ -91,5 +101,13 @@ export function fmtMs(n: number | undefined): string {
   if (n == null) {
     return "—";
   }
-  return n >= 1000 ? `${(n / 1000).toFixed(2)}s` : `${n}ms`;
+  if (n >= 1000) {
+    return `${(n / 1000).toFixed(2)}s`;
+  } else if (n >= 100) {
+    return `${n.toFixed(0)}ms`;
+  } else if (n >= 10) {
+    return `${n.toFixed(1)}ms`;
+  } else {
+    return `${n.toFixed(3)}ms`;
+  }
 }
