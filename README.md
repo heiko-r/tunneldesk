@@ -11,6 +11,7 @@ A local HTTP proxy for Cloudflare Tunnels with request inspection and WebSocket 
 - **Request Inspection**: Captures all request/response headers and bodies in memory
 - **Cloudflare Integration**: Automatically creates and syncs tunnel configuration
 - **Configuration File**: TOML-based configuration which stays in sync with the Cloudflare Tunnel configuration
+- **MCP Support**: Run as an MCP server on stdio
 
 ## Installation
 
@@ -29,7 +30,7 @@ cd frontend && npm run build && cd ..
 # Build with native GUI (default)
 cargo build --release
 
-# Build headless only (no system webview required)
+# Build headless only (no system webview required), and without MCP support
 cargo build --release --no-default-features
 ```
 
@@ -82,6 +83,31 @@ socket_path = "/tmp/api.sock"
 target_port = 3000
 ```
 
+## MCP Usage
+
+Example `mcp_config.json` for VS-code like IDEs:
+
+```json
+{
+  "mcpServers": {
+    "tunneldesk": {
+      "command": "/path/to/tunneldesk",
+      "args": [
+        "--mcp",
+        "--config",
+        "/path/to/config.toml"
+      ]
+    }
+  }
+}
+```
+
+Add to Claude Code:
+
+```bash
+claude mcp add --transport stdio tunneldesk -- /path/to/tunneldesk --mcp --config /path/to/config.toml
+```
+
 ## Development
 
 ```bash
@@ -90,6 +116,9 @@ cargo run
 
 # Run proxy (headless)
 cargo run -- --no-gui
+
+# Run as MCP server
+cargo run -- --mcp
 
 # Run tests
 cargo test

@@ -323,7 +323,7 @@ impl WebServer {
 
     // ── CRUD handlers ─────────────────────────────────────────────────────────
 
-    async fn handle_create_tunnel(&self, req: CreateTunnelRequest) -> WebSocketResponse {
+    pub(crate) async fn handle_create_tunnel(&self, req: CreateTunnelRequest) -> WebSocketResponse {
         // Validate uniqueness.
         {
             let cfg = self.config.read().await;
@@ -377,7 +377,7 @@ impl WebServer {
         WebSocketResponse::TunnelCreated(info)
     }
 
-    async fn handle_update_tunnel(&self, req: UpdateTunnelRequest) -> WebSocketResponse {
+    pub(crate) async fn handle_update_tunnel(&self, req: UpdateTunnelRequest) -> WebSocketResponse {
         let old_tunnel = {
             let cfg = self.config.read().await;
             match cfg.tunnels.iter().find(|t| t.name == req.name) {
@@ -449,7 +449,7 @@ impl WebServer {
         WebSocketResponse::TunnelUpdated(info)
     }
 
-    async fn handle_delete_tunnel(&self, req: DeleteTunnelRequest) -> WebSocketResponse {
+    pub(crate) async fn handle_delete_tunnel(&self, req: DeleteTunnelRequest) -> WebSocketResponse {
         let tunnel = {
             let cfg = self.config.read().await;
             match cfg.tunnels.iter().find(|t| t.name == req.name) {
@@ -546,7 +546,10 @@ impl WebServer {
 
     // ── Replay handler ────────────────────────────────────────────────────────
 
-    async fn handle_replay_request(&self, req: ReplayRequestPayload) -> WebSocketResponse {
+    pub(crate) async fn handle_replay_request(
+        &self,
+        req: ReplayRequestPayload,
+    ) -> WebSocketResponse {
         macro_rules! err {
             ($msg:expr) => {
                 return WebSocketResponse::ReplayResponse(ReplayResponsePayload {

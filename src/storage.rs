@@ -445,6 +445,13 @@ impl RequestStorage {
         }
     }
 
+    /// Returns the [`RequestExchange`] with the given `id`, or `None` if not found.
+    #[cfg(any(feature = "mcp", test))]
+    pub async fn get_request_by_id(&self, id: &str) -> Option<RequestExchange> {
+        let requests = self.requests.read().await;
+        requests.get(id).cloned()
+    }
+
     #[cfg(test)]
     pub async fn get_all_requests(&self) -> Vec<RequestExchange> {
         let requests = self.requests.read().await;
@@ -486,12 +493,6 @@ impl RequestStorage {
         });
 
         results
-    }
-
-    #[cfg(test)]
-    pub async fn get_request_by_id(&self, id: &str) -> Option<RequestExchange> {
-        let requests = self.requests.read().await;
-        requests.get(id).cloned()
     }
 
     #[cfg(test)]

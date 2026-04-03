@@ -2,6 +2,8 @@ mod capture;
 mod cloudflare;
 mod cloudflared;
 mod config;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod proxy;
 mod storage;
 mod sync;
@@ -38,6 +40,12 @@ struct Args {
     /// Run without a native GUI window (headless server mode)
     #[arg(long)]
     no_gui: bool,
+
+    /// Run as an MCP server on stdio (requires the `mcp` Cargo feature).
+    /// Tracing output is redirected to stderr so it does not interfere with
+    /// the MCP protocol stream.
+    #[arg(long)]
+    mcp: bool,
 }
 
 impl Args {
@@ -74,13 +82,42 @@ fn default_config_path() -> PathBuf {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // Guard against --mcp on builds that lack the feature.
+    #[cfg(not(feature = "mcp"))]
+    if args.mcp {
+        anyhow::bail!(
+            "This binary was not compiled with the 'mcp' feature. \
+             Rebuild with `--features mcp`."
+        );
+    }
 
+    // When acting as an MCP server, stdout carries the JSON-RPC protocol
+    // stream, so tracing must be redirected to stderr instead.
+    #[cfg(feature = "mcp")]
+    if args.mcp {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
+    // When the mcp feature is absent --mcp is already rejected above, so we
+    // always take the normal tracing path here.
+    #[cfg(not(feature = "mcp"))]
+    {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
+
+    // --mcp implies headless: the GUI must not own stdout.
     #[cfg(feature = "gui")]
-    if !args.no_gui {
+    if !args.no_gui && !args.mcp {
         gui::launch(args); // diverges: tao event loop runs forever
     }
 
@@ -136,14 +173,40 @@ pub(crate) async fn init_app(
         ))
     };
 
-    // Create and start web server
+    // Create and start web server.
+    // Clone tunnel_sync so the MCP server (when enabled) can share the same
+    // Cloudflare sync handle without requiring a second Arc.
     let web_server = WebServer::new(
         shared_config.clone(),
         tunnel_manager.clone(),
-        tunnel_sync,
+        tunnel_sync.clone(),
         request_storage.clone(),
         websocket_storage.clone(),
     );
+
+    // Start MCP stdio server when requested (feature-gated).
+    #[cfg(feature = "mcp")]
+    if args.mcp {
+        let mcp_server = mcp::TunnelDeskMcp::new(
+            shared_config.clone(),
+            tunnel_manager.clone(),
+            tunnel_sync,
+            request_storage.clone(),
+            websocket_storage.clone(),
+        );
+        tokio::spawn(async move {
+            use rmcp::ServiceExt as _;
+            match mcp_server.serve(rmcp::transport::io::stdio()).await {
+                Ok(service) => {
+                    if let Err(e) = service.waiting().await {
+                        tracing::error!("MCP server error: {e}");
+                    }
+                }
+                Err(e) => tracing::error!("Failed to start MCP server: {e}"),
+            }
+        });
+    }
+
     let web_server_handle = tokio::spawn(async move {
         if let Err(e) = web_server.start().await {
             tracing::error!("Web server error: {}", e);
