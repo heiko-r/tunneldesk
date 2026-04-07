@@ -10,8 +10,10 @@ use axum::{
     routing::get,
 };
 use base64::Engine as _;
+use rand::{Rng, distr::Alphanumeric};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -337,7 +339,7 @@ impl WebServer {
 
         let socket_path = req
             .socket_path
-            .unwrap_or_else(|| format!("/tmp/tunneldesk-{}.sock", req.name));
+            .unwrap_or_else(|| get_default_socket_path(&req.name));
 
         let new_tunnel = TunnelConfig {
             name: req.name.clone(),
@@ -845,6 +847,18 @@ fn websocket_message_to_base64(
     }
 }
 
+fn get_default_socket_path(tunnel_name: &str) -> String {
+    let suffix: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect();
+    let filename = format!("tunneldesk-{}-{}.sock", tunnel_name, suffix);
+    let mut dir = env::temp_dir();
+    dir.push(filename);
+    dir.to_string_lossy().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,7 +1151,7 @@ mod tests {
 
         let cfg = server.config.read().await;
         let t = cfg.tunnels.iter().find(|t| t.name == "auto-path").unwrap();
-        assert_eq!(t.socket_path, "/tmp/tunneldesk-auto-path.sock");
+        assert!(t.socket_path.contains("tunneldesk-auto-path"));
     }
 
     // --- handle_update_tunnel ---
@@ -1562,5 +1576,74 @@ mod tests {
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["enabled"], false);
+    }
+
+    // --- get_default_socket_path ---
+
+    #[test]
+    fn test_get_default_socket_path_generates_valid_path() {
+        let tunnel_name = "test-tunnel";
+        let path = get_default_socket_path(tunnel_name);
+
+        // Check that the path contains the tunnel name
+        assert!(path.contains(tunnel_name));
+
+        // Check that it has the expected format
+        assert!(path.contains("tunneldesk-"));
+        assert!(path.contains(&format!("-{}-", tunnel_name)));
+
+        // Check that it ends with .sock
+        assert!(path.ends_with(".sock"));
+
+        // Check that the suffix is 8 characters long (alphanumeric)
+        let parts: Vec<&str> = path.split('-').collect();
+        assert_eq!(parts.len(), 4); // ["tunneldesk", "test", "tunnel", "ABCDEF.sock"]
+    }
+
+    #[test]
+    fn test_get_default_socket_path_unique_calls() {
+        let tunnel_name = "unique-tunnel";
+
+        // Generate multiple paths and ensure they're different
+        let path1 = get_default_socket_path(tunnel_name);
+        let path2 = get_default_socket_path(tunnel_name);
+        let path3 = get_default_socket_path(tunnel_name);
+
+        // All paths should be different
+        assert_ne!(path1, path2);
+        assert_ne!(path2, path3);
+        assert_ne!(path1, path3);
+
+        // But they should all contain the tunnel name
+        assert!(path1.contains(tunnel_name));
+        assert!(path2.contains(tunnel_name));
+        assert!(path3.contains(tunnel_name));
+    }
+
+    #[test]
+    fn test_get_default_socket_path_different_tunnel_names() {
+        let path1 = get_default_socket_path("tunnel-a");
+        let path2 = get_default_socket_path("tunnel-b");
+
+        // Paths should be different
+        assert_ne!(path1, path2);
+
+        // Each should contain its respective tunnel name
+        assert!(path1.contains("tunnel-a"));
+        assert!(path2.contains("tunnel-b"));
+
+        // Neither should contain the other's tunnel name
+        assert!(!path1.contains("tunnel-b"));
+        assert!(!path2.contains("tunnel-a"));
+    }
+
+    #[test]
+    fn test_get_default_socket_path_special_characters() {
+        let tunnel_name = "tunnel_with_123";
+        let path = get_default_socket_path(tunnel_name);
+
+        // Should handle special characters in tunnel names
+        assert!(path.contains(tunnel_name));
+        assert!(path.ends_with(".sock"));
     }
 }

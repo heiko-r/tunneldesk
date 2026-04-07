@@ -1,19 +1,33 @@
+<div align="center">
+  <img src="./logo.svg" alt="TunnelDesk Logo" width="100px">
+</div>
+
 # TunnelDesk
 
 A local HTTP proxy for Cloudflare Tunnels with request inspection and WebSocket support.
 
+![Screenshot of app GUI](./screenshot.png)
+
 ## Features
 
 - **Native GUI Window**: Opens a native webview window on startup — no browser required
-- **CLI mode**: Optionally run without the GUI window and access the UI via browser
-- **Multiple Tunnels**: Configure multiple tunnels, each with their own subdomain
+- **CLI mode**: Optionally run without the GUI window and view requests and responses on stdout or access the UI via browser
+- **Multiple Tunnels**: Manage multiple tunnels, each with their own subdomain.
 - **HTTP & WebSocket Support**: Forward both HTTP requests and WebSocket connections
 - **Request Inspection**: Captures all request/response headers and bodies in memory
-- **Cloudflare Integration**: Automatically creates and syncs tunnel configuration
+- **Cloudflare Integration**: Automatically creates and syncs tunnel configuration, and sets up cache bypass
 - **Configuration File**: TOML-based configuration which stays in sync with the Cloudflare Tunnel configuration
 - **MCP Support**: Run as an MCP server on stdio
 
 ## Installation
+
+### Prerequisites
+
+[cloudflared](https://github.com/cloudflare/cloudflared) needs to be installed and available in your PATH already, but doesn't need to be linked to your account yet.
+
+### Pre-built binaries
+
+For MacOS and Windows, pre-built binaries are available from the [releases](https://github.com/heiko-r/tunneldesk/releases).
 
 ### Linux dependencies (for the native GUI window)
 
@@ -34,28 +48,18 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
-## Usage
-
-```bash
-# Start with native GUI window (default)
-./tunneldesk
-
-# Start in headless server mode
-./tunneldesk --no-gui
-
-# Use a custom config file
-./tunneldesk --config /path/to/config.toml
-```
-
-When launched in GUI mode, TunnelDesk opens a native window showing the web UI. Closing the window shuts down the application. In headless mode the UI is accessible at `http://127.0.0.1:3013` (or the port set in `config.toml`).
-
 ## Configuration
 
-Create a `config.toml` file:
+Create a `config.toml` file. An example showing the default values plus two tunnels is shown below.
+
+To use TunnelDesk to manage your tunnels on the Cloudflare side too, you need to, as a minimum, provide the Cloudflare API token, account ID, zone ID, and tunnel name. The first three, you can get from the Cloudflare Dashboard. The tunnel name can be any string to use as the tunnel identifier in Cloudflare. If `cloudflared` is already set up and linked to your account, you can provide the tunnel ID and token directly in the configuration file.
+
+Tunnels can be created later via the GUI.
 
 ```toml
 [logging]
 stdout_level = "basic"
+
 [capture]
 max_stored_requests = 1000
 max_request_body_size = 10485760
@@ -83,7 +87,22 @@ socket_path = "/tmp/api.sock"
 target_port = 3000
 ```
 
-## MCP Usage
+## Usage
+
+```bash
+# Start with native GUI window (default)
+./tunneldesk
+
+# Start in headless server mode
+./tunneldesk --no-gui
+
+# Use a custom config file
+./tunneldesk --config /path/to/config.toml
+```
+
+When launched in GUI mode, TunnelDesk opens a native window showing the web UI. Closing the window shuts down the application. In headless mode the UI is accessible at `http://127.0.0.1:3013` (or the port set in `config.toml`).
+
+### MCP Usage
 
 Example `mcp_config.json` for VS-code like IDEs:
 

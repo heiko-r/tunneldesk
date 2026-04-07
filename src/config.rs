@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// One entry per Cloudflare Tunnel to proxy.
+    #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
     /// Controls what is written to stdout.
+    #[serde(default)]
     pub logging: LoggingConfig,
     /// Controls how captured traffic is stored in memory.
+    #[serde(default)]
     pub capture: CaptureConfig,
     /// Configuration for the local web UI server.
+    #[serde(default)]
     pub gui: GuiConfig,
     /// Optional Cloudflare integration settings.
     #[serde(default)]
@@ -50,6 +54,7 @@ impl CloudflareConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Verbosity of stdout logging.  Accepted values: `"off"`, `"basic"`, `"full"`.
+    #[serde(default = "LoggingConfig::default_stdout_level")]
     pub stdout_level: String,
     /// Maximum bytes of a request/response/WebSocket body to log to stdout when
     /// `stdout_level` is `full`.  Independent of the stored body size limit.
@@ -59,8 +64,20 @@ pub struct LoggingConfig {
 }
 
 impl LoggingConfig {
+    fn default_stdout_level() -> String {
+        "basic".to_string()
+    }
     fn default_max_request_body_size() -> usize {
         1024
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            stdout_level: Self::default_stdout_level(),
+            max_request_body_size: Self::default_max_request_body_size(),
+        }
     }
 }
 
@@ -69,17 +86,53 @@ impl LoggingConfig {
 pub struct CaptureConfig {
     /// Maximum number of request–response exchanges kept in memory.
     /// When the limit is reached the oldest entry is evicted.
+    #[serde(default = "CaptureConfig::default_max_stored_requests")]
     pub max_stored_requests: usize,
     /// Maximum bytes of a body to store.  Bodies that exceed this limit are
     /// truncated in storage; proxying always forwards the full body.
+    #[serde(default = "CaptureConfig::default_max_request_body_size")]
     pub max_request_body_size: usize,
+}
+
+impl CaptureConfig {
+    fn default_max_stored_requests() -> usize {
+        1000
+    }
+
+    fn default_max_request_body_size() -> usize {
+        10485760 // 10 MB
+    }
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        CaptureConfig {
+            max_stored_requests: Self::default_max_stored_requests(),
+            max_request_body_size: Self::default_max_request_body_size(),
+        }
+    }
 }
 
 /// Configuration for the built-in web UI server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiConfig {
-    /// TCP port the web UI listens on (e.g. `8081`).
+    /// TCP port the web UI listens on (e.g. `3013`).
+    #[serde(default = "GuiConfig::default_port")]
     pub port: u16,
+}
+
+impl GuiConfig {
+    fn default_port() -> u16 {
+        3013
+    }
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        GuiConfig {
+            port: Self::default_port(),
+        }
+    }
 }
 
 /// Configuration for a single Cloudflare Tunnel proxy.
