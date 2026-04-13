@@ -17,10 +17,11 @@ async fn is_root() -> bool {
 
 /// Runs `program args` with elevated privileges.
 ///
-/// On Unix: prepends `sudo` when the current process is not already root.
+/// On Linux: uses `pkexec` for a GUI auth dialog when in a graphical session, otherwise `sudo`.
+/// On MacOS: uses `osascript` to show a GUI dialog.
 /// On Windows: runs the command directly (the caller must hold administrator rights).
 async fn privileged(program: &str, args: &[&str]) -> anyhow::Result<std::process::ExitStatus> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         if is_root().await {
             Command::new(program)
@@ -28,7 +29,16 @@ async fn privileged(program: &str, args: &[&str]) -> anyhow::Result<std::process
                 .status()
                 .await
                 .with_context(|| format!("failed to run `{program}`"))
+        } else if std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok() {
+            // Graphical session: use pkexec for a GUI auth dialog
+            Command::new("pkexec")
+                .arg(program)
+                .args(args)
+                .status()
+                .await
+                .with_context(|| format!("failed to run `pkexec {program}`"))
         } else {
+            // Headless/terminal: fall back to sudo
             Command::new("sudo")
                 .arg(program)
                 .args(args)
@@ -37,6 +47,39 @@ async fn privileged(program: &str, args: &[&str]) -> anyhow::Result<std::process
                 .with_context(|| format!("failed to run `sudo {program}`"))
         }
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        if is_root().await {
+            Command::new(program)
+                .args(args)
+                .status()
+                .await
+                .with_context(|| format!("failed to run `{program}`"))
+        } else {
+            // Build a quoted shell command string for osascript
+            let args_str = args
+                .iter()
+                .map(|a| shell_escape(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let shell_cmd = if args_str.is_empty() {
+                shell_escape(program)
+            } else {
+                format!("{} {}", shell_escape(program), args_str)
+            };
+
+            let script = format!(r#"do shell script "{shell_cmd}" with administrator privileges"#);
+
+            Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .status()
+                .await
+                .with_context(|| format!("failed to run `{program}` via osascript"))
+        }
+    }
+
     #[cfg(windows)]
     {
         Command::new(program)
@@ -45,6 +88,17 @@ async fn privileged(program: &str, args: &[&str]) -> anyhow::Result<std::process
             .await
             .with_context(|| format!("failed to run `{program}`"))
     }
+}
+
+/// Minimal shell-escaping for macOS osascript: wraps in quotes and escapes
+/// backslashes, double-quotes, and backticks.
+#[cfg(target_os = "macos")]
+fn shell_escape(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`");
+    format!("\"{escaped}\"")
 }
 
 /// Manages the `cloudflared` system service.
@@ -88,12 +142,12 @@ impl CloudflaredService {
 
         #[cfg(target_os = "windows")]
         {
-            Command::new("sc")
-                .args(["query", "cloudflared"])
+            Command::new("Get-Service")
+                .args(["-Name", "Cloudflared"])
                 .output()
                 .await
                 .map_or(false, |out| {
-                    String::from_utf8_lossy(&out.stdout).contains("RUNNING")
+                    String::from_utf8_lossy(&out.stdout).contains("Running")
                 })
         }
 
@@ -116,50 +170,6 @@ impl CloudflaredService {
             );
         }
         Ok(())
-    }
-
-    /// Restarts the cloudflared system service.
-    pub async fn restart() -> anyhow::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let status = privileged("systemctl", &["restart", "cloudflared"]).await?;
-
-            if !status.success() {
-                anyhow::bail!(
-                    "`systemctl restart cloudflared` failed with status {}",
-                    status
-                );
-            }
-            Ok(())
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            // On macOS, stop then start the launchd service.
-            privileged("launchctl", &["stop", "com.cloudflare.cloudflared"])
-                .await
-                .ok();
-            let status = privileged("launchctl", &["start", "com.cloudflare.cloudflared"]).await?;
-            if !status.success() {
-                anyhow::bail!("launchctl start cloudflared failed with status {}", status);
-            }
-            Ok(())
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            privileged("sc", &["stop", "cloudflared"]).await.ok();
-            let status = privileged("sc", &["start", "cloudflared"]).await?;
-            if !status.success() {
-                anyhow::bail!("sc start cloudflared failed with status {}", status);
-            }
-            Ok(())
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            anyhow::bail!("restart not supported on this platform");
-        }
     }
 }
 

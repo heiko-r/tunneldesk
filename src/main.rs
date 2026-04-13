@@ -60,9 +60,10 @@ impl Args {
 
 /// Returns the default config file path.
 ///
-/// - macOS `.app` bundle: `~/Library/Application Support/TunnelDesk/config.toml`
+/// - macOS `.app` bundle: `~/Library/Application Support/TunnelDesk/config.toml`,
+///   else `config.toml` in the working directory
 /// - Windows: `%APPDATA%\TunnelDesk\config.toml`
-/// - Everywhere else: `config.toml` in the working directory.
+/// - Everywhere else: `~/.config/TunnelDesk/config.toml`
 fn default_config_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -81,6 +82,13 @@ fn default_config_path() -> PathBuf {
             return PathBuf::from(appdata)
                 .join("TunnelDesk")
                 .join("config.toml");
+        }
+    }
+    #[cfg(unix)]
+    {
+        // Linux and other Unix-like systems
+        if let Some(home_dir) = home::home_dir() {
+            return home_dir.join(".config/TunnelDesk/config.toml");
         }
     }
     PathBuf::from("config.toml")

@@ -888,7 +888,7 @@ mod tests {
     async fn test_body_at_limit_state() {
         let body = vec![b'X'; 100];
         let msg_bytes = {
-            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            let header = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
             let mut v = header.as_bytes().to_vec();
             v.extend_from_slice(&body);
             v
@@ -908,7 +908,7 @@ mod tests {
         // the state machine should have reset to FindingHeaders.
         let body = vec![b'Z'; 500];
         let msg_bytes = {
-            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n");
+            let header = "HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n";
             let mut v = header.as_bytes().to_vec();
             v.extend_from_slice(&body);
             v
@@ -1039,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn test_large_body_multiple_reads_all_forwarded() {
         let body = vec![0xCD_u8; 10_000];
-        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n");
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n";
         let mut data = header.as_bytes().to_vec();
         data.extend_from_slice(&body);
         let total_len = data.len();

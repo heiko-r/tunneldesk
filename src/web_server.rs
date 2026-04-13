@@ -1211,11 +1211,11 @@ mod tests {
         let WebSocketResponse::TunnelUpdated(info) = response else {
             panic!("expected TunnelUpdated, got {:?}", response);
         };
-        assert_eq!(info.enabled, false);
+        assert!(!info.enabled);
 
         let cfg = server.config.read().await;
         let t = cfg.tunnels.iter().find(|t| t.name == "tunnel-a").unwrap();
-        assert_eq!(t.enabled, false);
+        assert!(!t.enabled);
 
         // stop_tunnel must have been called (not restart_tunnel, which would
         // re-add the handle).

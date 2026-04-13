@@ -212,13 +212,7 @@ impl Config {
     /// Returns a built-in default configuration suitable for development.
     pub fn default_config() -> Self {
         Config {
-            tunnels: vec![TunnelConfig {
-                name: "webapp".to_string(),
-                domain: "webapp.tunnel.example.com".to_string(),
-                socket_path: "/tmp/webapp.sock".to_string(),
-                target_port: 8080,
-                enabled: true,
-            }],
+            tunnels: vec![],
             logging: LoggingConfig {
                 stdout_level: "basic".to_string(),
                 max_request_body_size: LoggingConfig::default_max_request_body_size(),
@@ -245,11 +239,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default_config();
 
-        assert_eq!(config.tunnels.len(), 1);
-        assert_eq!(config.tunnels[0].name, "webapp");
-        assert_eq!(config.tunnels[0].socket_path, "/tmp/webapp.sock");
-        assert_eq!(config.tunnels[0].target_port, 8080);
-        assert!(config.tunnels[0].enabled);
+        assert_eq!(config.tunnels.len(), 0);
         assert_eq!(config.logging.stdout_level, "basic");
         assert_eq!(config.logging.max_request_body_size, 1024);
         assert_eq!(config.capture.max_stored_requests, 1000);

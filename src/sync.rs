@@ -5,7 +5,6 @@ use anyhow::Context;
 use tracing::{info, warn};
 
 use crate::cloudflare::{CloudflareClient, IngressRule, TunnelConfiguration};
-use crate::cloudflared::CloudflaredService;
 use crate::config::{Config, TunnelConfig};
 
 /// Summary of a sync operation.
@@ -109,13 +108,6 @@ impl TunnelSync {
             report.errors.push(e);
         }
 
-        // Restart cloudflared if ingress changed.
-        let changed = !report.added.is_empty() || !report.removed.is_empty();
-        if changed && let Err(e) = CloudflaredService::restart().await {
-            warn!("cloudflared restart after sync failed: {e}");
-            report.errors.push(format!("cloudflared restart: {e}"));
-        }
-
         report
     }
 
@@ -189,10 +181,6 @@ impl TunnelSync {
             anyhow::bail!("partial failure removing hosts: {}", errors.join("; "));
         }
 
-        if let Err(e) = CloudflaredService::restart().await {
-            warn!("cloudflared restart after remove_hosts failed: {e}");
-        }
-
         Ok(hostnames.to_vec())
     }
 
@@ -225,10 +213,6 @@ impl TunnelSync {
             .context("put_tunnel_config")?;
 
         self.apply_cache_rule(&current.ingress).await;
-
-        if let Err(e) = CloudflaredService::restart().await {
-            warn!("cloudflared restart after add_single_tunnel failed: {e}");
-        }
         Ok(())
     }
 
@@ -273,10 +257,6 @@ impl TunnelSync {
             .context("put_tunnel_config")?;
 
         self.apply_cache_rule(&current.ingress).await;
-
-        if let Err(e) = CloudflaredService::restart().await {
-            warn!("cloudflared restart after remove_single_tunnel failed: {e}");
-        }
         Ok(())
     }
 
@@ -344,10 +324,6 @@ impl TunnelSync {
             .context("put_tunnel_config")?;
 
         self.apply_cache_rule(&current.ingress).await;
-
-        if let Err(e) = CloudflaredService::restart().await {
-            warn!("cloudflared restart after update_single_tunnel failed: {e}");
-        }
         Ok(())
     }
 

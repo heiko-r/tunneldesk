@@ -52,6 +52,12 @@ cargo build --release --no-default-features
 
 Create a `config.toml` file. An example showing the default values plus two tunnels is shown below.
 
+Pass the path to the `config.toml` via the `--config` flag when running the application, or place it in these default locations:
+
+- Linux: `~/.config/TunnelDesk/config.toml`
+- macOS: `~/Library/Application Support/TunnelDesk/config.toml`
+- Windows: `%APPDATA%\TunnelDesk\config.toml`
+
 To use TunnelDesk to manage your tunnels on the Cloudflare side too, you need to, as a minimum, provide the Cloudflare API token, account ID, zone ID, and tunnel name. The first three, you can get from the Cloudflare Dashboard. The tunnel name can be any string to use as the tunnel identifier in Cloudflare. If `cloudflared` is already set up and linked to your account, you can provide the tunnel ID and token directly in the configuration file.
 
 Tunnels can be created later via the GUI.
@@ -101,6 +107,8 @@ target_port = 3000
 ```
 
 When launched in GUI mode, TunnelDesk opens a native window showing the web UI. Closing the window shuts down the application. In headless mode the UI is accessible at `http://127.0.0.1:3013` (or the port set in `config.toml`).
+
+On Linux and MacOS, the application will request root access to install the `cloudflared` service. On Windows, the application needs to be run as administrator.
 
 ### MCP Usage
 
