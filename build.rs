@@ -6,6 +6,7 @@ use {
 fn main() -> io::Result<()> {
     if env::var_os("CARGO_CFG_WINDOWS").is_some() {
         WindowsResource::new()
+            .set_icon("assets/icon.ico")
             .set_manifest(
                 r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

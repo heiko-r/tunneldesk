@@ -1,14 +1,21 @@
+use std::io::Cursor;
 use std::sync::Arc;
 
+use image::ImageReader;
+use rust_embed::Embed;
 use tao::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder},
-    window::WindowBuilder,
+    window::{Icon, WindowBuilder},
 };
 use wry::WebViewBuilder;
 
 use crate::{Args, config::Config};
+
+#[derive(Embed)]
+#[folder = "assets"]
+struct AppAssets;
 
 /// Launches the native GUI window. Runs the tao event loop on the calling
 /// (main) thread; the Tokio runtime and all app logic run on a background thread.
@@ -55,9 +62,19 @@ pub fn launch(args: Args) -> ! {
         });
     });
 
+    let icon_file = AppAssets::get("icon.png").expect("failed to load app icon");
+    let mut icon_reader = ImageReader::new(Cursor::new(icon_file.data));
+    icon_reader.set_format(image::ImageFormat::Png);
+    let icon_data = icon_reader
+        .decode()
+        .expect("failed to decode app icon")
+        .to_rgba8();
+    let icon = Icon::from_rgba(icon_data.into_raw(), 256, 256).expect("failed to create app icon");
+
     let window = WindowBuilder::new()
         .with_title("TunnelDesk")
         .with_inner_size(LogicalSize::new(1280.0_f64, 800.0_f64))
+        .with_window_icon(Some(icon))
         .build(&event_loop)
         .expect("failed to create window");
 
