@@ -142,8 +142,8 @@ impl CloudflaredService {
 
         #[cfg(target_os = "windows")]
         {
-            Command::new("Get-Service")
-                .args(["-Name", "Cloudflared"])
+            Command::new("powershell")
+                .args(["-Command", "Get-Service -Name Cloudflared"])
                 .output()
                 .await
                 .map_or(false, |out| {
