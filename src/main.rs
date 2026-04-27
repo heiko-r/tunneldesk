@@ -142,9 +142,21 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run_headless(args: Args) -> anyhow::Result<()> {
-    let (tunnel_manager, web_server_handle, _port) = init_app(&args).await?;
+    let (tunnel_manager, web_server_handle, tunnel_sync, config) = init_app(&args).await?;
 
     tunnel_manager.wait_for_shutdown_signal().await;
+
+    // Cloudflare cleanup: remove all configured tunnels on shutdown
+    if let Some(sync) = tunnel_sync {
+        let cfg = config.read().await;
+        if let Err(e) = sync.remove_all_configured_tunnels(&cfg).await {
+            tracing::warn!("Failed to remove tunnels from Cloudflare during shutdown: {e}");
+        } else {
+            tracing::info!("Removed all configured tunnels from Cloudflare");
+        }
+        drop(cfg);
+    }
+
     tunnel_manager.shutdown().await;
     web_server_handle.abort();
 
@@ -152,10 +164,15 @@ async fn run_headless(args: Args) -> anyhow::Result<()> {
 }
 
 /// Initialises all app components and returns handles needed for lifecycle management.
-/// Returns `(tunnel_manager, web_server_handle, gui_port)`.
+/// Returns `(tunnel_manager, web_server_handle, tunnel_sync, config)`.
 pub(crate) async fn init_app(
     args: &Args,
-) -> anyhow::Result<(Arc<TunnelManager>, tokio::task::JoinHandle<()>, u16)> {
+) -> anyhow::Result<(
+    Arc<TunnelManager>,
+    tokio::task::JoinHandle<()>,
+    Option<Arc<TunnelSync>>,
+    Arc<RwLock<Config>>,
+)> {
     // Load configuration
     let config_path = args.resolved_config();
     let mut config = if config_path.exists() {
@@ -177,7 +194,6 @@ pub(crate) async fn init_app(
     let websocket_storage = Arc::new(WebSocketMessageStorage::new(
         cfg.capture.max_stored_requests,
     ));
-    let port = cfg.gui.port;
     drop(cfg);
 
     // Create tunnel manager
@@ -204,10 +220,11 @@ pub(crate) async fn init_app(
     // Start MCP stdio server when requested (feature-gated).
     #[cfg(feature = "mcp")]
     if args.mcp {
+        let mcp_tunnel_sync = tunnel_sync.clone();
         let mcp_server = mcp::TunnelDeskMcp::new(
             shared_config.clone(),
             tunnel_manager.clone(),
-            tunnel_sync,
+            mcp_tunnel_sync,
             request_storage.clone(),
             websocket_storage.clone(),
         );
@@ -236,7 +253,12 @@ pub(crate) async fn init_app(
         tunnel_manager.start_tunnels(&cfg).await;
     }
 
-    Ok((tunnel_manager, web_server_handle, port))
+    Ok((
+        tunnel_manager,
+        web_server_handle,
+        tunnel_sync,
+        shared_config,
+    ))
 }
 
 /// Performs Cloudflare setup if `[cloudflare]` is configured.

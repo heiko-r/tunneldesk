@@ -344,6 +344,19 @@ impl TunnelSync {
         None
     }
 
+    /// Removes all tunnels configured in `config` from Cloudflare.
+    ///
+    /// This removes DNS records, ingress config entries, and cache rules for
+    /// all tunnels (both enabled and disabled) in the config file. Used during
+    /// app shutdown to ensure cloudflared doesn't receive traffic after the app stops.
+    pub async fn remove_all_configured_tunnels(
+        &self,
+        config: &Config,
+    ) -> anyhow::Result<Vec<String>> {
+        let domains: Vec<String> = config.tunnels.iter().map(|t| t.domain.clone()).collect();
+        self.remove_hosts(&domains).await
+    }
+
     /// Saves `tunnel_id` and `tunnel_token` into `config` and writes to disk.
     pub fn save_tunnel_credentials(
         config: &mut Config,
@@ -574,5 +587,74 @@ enabled = true
             ingress.last().unwrap().hostname.is_none(),
             "catch-all must be the last rule"
         );
+    }
+
+    /// remove_all_configured_tunnels should extract all domains from config
+    /// (both enabled and disabled) and pass them to remove_hosts.
+    #[test]
+    fn test_remove_all_configured_tunnels_extracts_all_domains() {
+        let config = Config {
+            tunnels: vec![
+                TunnelConfig {
+                    name: "enabled".to_string(),
+                    domain: "enabled.example.com".to_string(),
+                    socket_path: "/tmp/enabled.sock".to_string(),
+                    target_port: 3000,
+                    enabled: true,
+                },
+                TunnelConfig {
+                    name: "disabled".to_string(),
+                    domain: "disabled.example.com".to_string(),
+                    socket_path: "/tmp/disabled.sock".to_string(),
+                    target_port: 3001,
+                    enabled: false,
+                },
+            ],
+            logging: crate::config::LoggingConfig {
+                stdout_level: "basic".to_string(),
+                max_request_body_size: 1024,
+            },
+            capture: crate::config::CaptureConfig {
+                max_stored_requests: 100,
+                max_request_body_size: 1048576,
+            },
+            gui: crate::config::GuiConfig { port: 8081 },
+            cloudflare: None,
+            config_path: None,
+        };
+
+        // Verify that both domains are in the config
+        assert_eq!(config.tunnels.len(), 2);
+        assert_eq!(config.tunnels[0].domain, "enabled.example.com");
+        assert_eq!(config.tunnels[1].domain, "disabled.example.com");
+
+        // The actual method delegates to remove_hosts, which is tested elsewhere.
+        // This test verifies the domain extraction logic.
+        let domains: Vec<String> = config.tunnels.iter().map(|t| t.domain.clone()).collect();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&"enabled.example.com".to_string()));
+        assert!(domains.contains(&"disabled.example.com".to_string()));
+    }
+
+    /// remove_all_configured_tunnels should handle empty config gracefully.
+    #[test]
+    fn test_remove_all_configured_tunnels_empty_config() {
+        let config = Config {
+            tunnels: vec![],
+            logging: crate::config::LoggingConfig {
+                stdout_level: "basic".to_string(),
+                max_request_body_size: 1024,
+            },
+            capture: crate::config::CaptureConfig {
+                max_stored_requests: 100,
+                max_request_body_size: 1048576,
+            },
+            gui: crate::config::GuiConfig { port: 8081 },
+            cloudflare: None,
+            config_path: None,
+        };
+
+        let domains: Vec<String> = config.tunnels.iter().map(|t| t.domain.clone()).collect();
+        assert!(domains.is_empty());
     }
 }

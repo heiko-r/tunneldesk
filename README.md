@@ -108,7 +108,9 @@ target_port = 3000
 
 When launched in GUI mode, TunnelDesk opens a native window showing the web UI. Closing the window shuts down the application. In headless mode the UI is accessible at `http://127.0.0.1:3013` (or the port set in `config.toml`).
 
-On Linux and MacOS, the application will request root access to install the `cloudflared` service. On Windows, the application needs to be run as administrator.
+On Linux and MacOS, the application will request root access to install the `cloudflared` service. This can be avoided by manually installing the `cloudflared` service and providing the tunnel ID and token in the configuration file. On Windows, the application needs to be run as administrator in any case.
+
+Note: The cloudflared service will remain installed and running after TunnelDesk is closed, but the subdomains, routes, and cache rules are removed from Cloudflare, so the tunnel will not be accessible anymore. To also remove the cloudflared service, run `cloudflared service uninstall`.
 
 ### MCP Usage
 

@@ -40,20 +40,38 @@ pub fn launch(args: Args) -> ! {
 
     // Channel to signal the background thread to shut down when the window closes.
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    // Channel for background thread to signal when cleanup is complete.
+    let (cleanup_done_tx, cleanup_done_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     // Background thread: runs the Tokio runtime and all async app logic.
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
         rt.block_on(async move {
             match crate::init_app(&args).await {
-                Ok((tunnel_manager, web_server_handle, _port)) => {
+                Ok((tunnel_manager, web_server_handle, tunnel_sync, config)) => {
                     // Wait for the window-close signal from the main thread.
                     tokio::task::spawn_blocking(move || shutdown_rx.recv().ok())
                         .await
                         .ok();
 
+                    // Cloudflare cleanup: remove all configured tunnels on shutdown
+                    if let Some(sync) = tunnel_sync {
+                        let cfg = config.read().await;
+                        if let Err(e) = sync.remove_all_configured_tunnels(&cfg).await {
+                            tracing::warn!(
+                                "Failed to remove tunnels from Cloudflare during shutdown: {e}"
+                            );
+                        } else {
+                            tracing::info!("Removed all configured tunnels from Cloudflare");
+                        }
+                        drop(cfg);
+                    }
+
                     tunnel_manager.shutdown().await;
                     web_server_handle.abort();
+
+                    // Signal main thread that cleanup is complete.
+                    let _ = cleanup_done_tx.send(());
                 }
                 Err(e) => {
                     tracing::error!("App initialisation failed: {e}");
@@ -81,9 +99,10 @@ pub fn launch(args: Args) -> ! {
     let loading_html = make_loading_html(port);
     let webview = build_webview(&window, &loading_html).expect("failed to create webview");
 
-    // Keep shutdown_tx alive in the closure so it is dropped (closing the channel)
-    // only when the event loop exits.
+    // Keep shutdown_tx and cleanup_done_rx alive in the closure so they are
+    // dropped (closing the channel) only when the event loop exits.
     let shutdown_tx = Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
+    let cleanup_done_rx = Arc::new(std::sync::Mutex::new(Some(cleanup_done_rx)));
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -95,12 +114,21 @@ pub fn launch(args: Args) -> ! {
             ..
         } = event
         {
-            // Signal the background thread before exiting.
+            // Signal the background thread to start shutdown.
             if let Ok(mut guard) = shutdown_tx.lock()
                 && let Some(tx) = guard.take()
             {
                 tx.send(()).ok();
             }
+
+            // Wait for background thread to complete cleanup before exiting.
+            if let Ok(mut guard) = cleanup_done_rx.lock()
+                && let Some(rx) = guard.take()
+            {
+                // Use a timeout to avoid hanging if cleanup fails
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            }
+
             *control_flow = ControlFlow::Exit;
         }
     })
