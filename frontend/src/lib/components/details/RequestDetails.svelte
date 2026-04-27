@@ -12,11 +12,13 @@
     activeRequestTab = $bindable(),
     onclose,
     onselectrequest,
+    detailPaneWidth = 800,
   }: {
     request: TunneledRequest;
     activeRequestTab: RequestTab;
     onclose: () => void;
     onselectrequest: (id: string) => void;
+    detailPaneWidth?: number;
   } = $props();
 
   let showReplayModal = $state(false);
@@ -41,7 +43,7 @@
   });
 </script>
 
-<div class="detail-pane">
+<div class="detail-pane" style="width: {detailPaneWidth}px">
   <div class="detail-header">
     <span class="badge {methodClass(request.method)}">{request.method}</span>
     <span class="detail-url">{request.url}</span>
@@ -118,7 +120,6 @@
 
 <style>
   .detail-pane {
-    width: 800px;
     min-width: 380px;
     display: flex;
     flex-direction: column;

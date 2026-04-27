@@ -21,6 +21,8 @@
   let sortField: "Timestamp" | "ResponseTime" = $state("Timestamp");
   let sortDir: "asc" | "desc" = $state("desc");
   let activeRequestTab: RequestTab = $state("headers");
+  let detailPaneWidth: number = $state(800);
+  let isResizing: boolean = $state(false);
 
   // All filtering and sorting is done server-side; the store holds the current query results.
   let tunnelRequests: TunneledRequest[] = $derived(storage.requests.get(selectedTunnel.name) || []);
@@ -59,11 +61,35 @@
     selectedRequestId = id;
     activeRequestTab = "headers";
   }
+
+  function startResize(e: MouseEvent) {
+    isResizing = true;
+    e.preventDefault();
+  }
+
+  function handleResize(e: MouseEvent) {
+    if (!isResizing) return;
+    const container = e.currentTarget as HTMLElement;
+    const rect = container.getBoundingClientRect();
+    const newWidth = rect.right - e.clientX;
+    detailPaneWidth = Math.max(380, Math.min(newWidth, window.innerWidth - 300));
+  }
+
+  function stopResize() {
+    isResizing = false;
+  }
 </script>
 
 <TunnelHeader tunnel={selectedTunnel} requests={tunnelRequests} onclear={clearRequests} />
 
-<div class="pane-split" class:has-detail={!!selectedRequest}>
+<div
+  class="pane-split"
+  class:has-detail={!!selectedRequest}
+  role="none"
+  onmousemove={handleResize}
+  onmouseup={stopResize}
+  onmouseleave={stopResize}
+>
   <div class="req-pane">
     <FilterBar bind:filterMethod bind:filterStatus bind:filterUrl count={tunnelRequests.length} />
     <RequestTable
@@ -76,9 +102,11 @@
   </div>
 
   {#if selectedRequest}
+    <button class="resize-handle" aria-label="Resize panel" onmousedown={startResize}></button>
     <RequestDetails
       request={selectedRequest}
       bind:activeRequestTab
+      {detailPaneWidth}
       onclose={() => {
         selectedRequestId = null;
       }}
@@ -100,6 +128,15 @@
     flex-direction: column;
     overflow: hidden;
     min-width: 0;
-    border-right: 1px solid var(--border);
+  }
+
+  .resize-handle {
+    width: 2px;
+    cursor: col-resize;
+    background: var(--border);
+    flex-shrink: 0;
+    transition: background 0.1s;
+    padding: 0;
+    border: none;
   }
 </style>
