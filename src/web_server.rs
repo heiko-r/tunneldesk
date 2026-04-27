@@ -121,6 +121,8 @@ pub enum WebSocketMessage {
     GetCloudflareStatus,
     // --- Replay ---
     ReplayRequest(ReplayRequestPayload),
+    // --- Request management ---
+    ClearRequests(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -688,6 +690,13 @@ impl WebServer {
             service_running,
         })
     }
+
+    async fn handle_clear_requests(&self, tunnel_name: String) -> WebSocketResponse {
+        self.request_storage
+            .clear_requests_for_tunnel(&tunnel_name)
+            .await;
+        WebSocketResponse::Requests(vec![])
+    }
 }
 
 fn tunnel_info_from_config(t: &TunnelConfig) -> TunnelInfo {
@@ -750,6 +759,9 @@ async fn websocket_connection(mut socket: axum::extract::ws::WebSocket, server: 
                                     }
                                     WebSocketMessage::ReplayRequest(req) => {
                                         server.handle_replay_request(req).await
+                                    }
+                                    WebSocketMessage::ClearRequests(tunnel_name) => {
+                                        server.handle_clear_requests(tunnel_name).await
                                     }
                                 };
 
@@ -1079,6 +1091,44 @@ mod tests {
         };
         assert_eq!(exchanges.len(), 1);
         assert_eq!(exchanges[0].request.id, "r1");
+    }
+
+    #[tokio::test]
+    async fn test_handle_clear_requests() {
+        let config = Arc::new(RwLock::new(make_config()));
+        let req_storage = Arc::new(RequestStorage::new(100));
+        let ws_storage = Arc::new(WebSocketMessageStorage::new(100));
+        let tm = Arc::new(TunnelManager::new(
+            &make_config(),
+            req_storage.clone(),
+            ws_storage.clone(),
+        ));
+        let server = WebServer::new(config, tm, None, req_storage.clone(), ws_storage);
+
+        // Store requests for different tunnels
+        let req1 = make_stored_request("r1", "tunnel-a", "GET", "/api");
+        let req2 = make_stored_request("r2", "tunnel-b", "POST", "/submit");
+        let req3 = make_stored_request("r3", "tunnel-a", "PUT", "/update");
+
+        req_storage.store_request(req1).await;
+        req_storage.store_request(req2).await;
+        req_storage.store_request(req3).await;
+
+        assert_eq!(req_storage.get_count().await, 3);
+
+        // Clear requests for tunnel-a
+        let response = server.handle_clear_requests("tunnel-a".to_string()).await;
+
+        let WebSocketResponse::Requests(exchanges) = response else {
+            panic!("expected Requests variant");
+        };
+        assert_eq!(exchanges.len(), 0);
+
+        // Verify only tunnel-b requests remain
+        assert_eq!(req_storage.get_count().await, 1);
+        assert!(req_storage.get_request_by_id("r1").await.is_none());
+        assert!(req_storage.get_request_by_id("r3").await.is_none());
+        assert!(req_storage.get_request_by_id("r2").await.is_some());
     }
 
     #[tokio::test]

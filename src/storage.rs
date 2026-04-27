@@ -495,6 +495,12 @@ impl RequestStorage {
         results
     }
 
+    /// Clears all requests for a specific tunnel.
+    pub async fn clear_requests_for_tunnel(&self, tunnel_name: &str) {
+        let mut requests = self.requests.write().await;
+        requests.retain(|_, exchange| exchange.request.tunnel_name != tunnel_name);
+    }
+
     #[cfg(test)]
     pub async fn clear(&self) {
         let mut requests = self.requests.write().await;
@@ -829,6 +835,28 @@ mod tests {
         storage.clear().await;
         assert_eq!(storage.get_count().await, 0);
         assert!(storage.get_request_by_id("req1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_requests_for_tunnel() {
+        let storage = RequestStorage::new(100);
+
+        let req1 = create_test_request("req1", "tunnel1", "GET", "http://example1.com");
+        let req2 = create_test_request("req2", "tunnel2", "POST", "http://example2.com");
+        let req3 = create_test_request("req3", "tunnel1", "PUT", "http://example3.com");
+
+        storage.store_request(req1).await;
+        storage.store_request(req2).await;
+        storage.store_request(req3).await;
+
+        assert_eq!(storage.get_count().await, 3);
+
+        storage.clear_requests_for_tunnel("tunnel1").await;
+
+        assert_eq!(storage.get_count().await, 1);
+        assert!(storage.get_request_by_id("req1").await.is_none());
+        assert!(storage.get_request_by_id("req3").await.is_none());
+        assert!(storage.get_request_by_id("req2").await.is_some());
     }
 
     #[tokio::test]

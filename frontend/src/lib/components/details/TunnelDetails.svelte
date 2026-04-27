@@ -1,6 +1,6 @@
 <script lang="ts">
   import { setActiveQueryFilter, storage, updateRequests } from "$lib/stores.svelte";
-  import { queryRequests } from "$lib/api/websocket.svelte";
+  import { queryRequests, clearRequests as clearRequestsBackend } from "$lib/api/websocket.svelte";
   import type { RequestTab, Tunnel, TunneledRequest } from "$lib/types";
   import TunnelHeader from "./TunnelHeader.svelte";
   import FilterBar from "./FilterBar.svelte";
@@ -53,7 +53,7 @@
   });
 
   function clearRequests() {
-    updateRequests(selectedTunnel.name, []);
+    clearRequestsBackend(selectedTunnel.name);
     selectedRequestId = null;
   }
 

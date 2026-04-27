@@ -399,4 +399,9 @@ export function sendReplay(
   });
 }
 
+/** Clears all requests for a specific tunnel. */
+export function clearRequests(tunnelName: string) {
+  send({ type: "ClearRequests", data: tunnelName });
+}
+
 connect();
