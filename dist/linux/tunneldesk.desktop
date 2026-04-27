@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=TunnelDesk
+Comment=A local HTTP proxy for Cloudflare Tunnels with request inspection
+Exec=tunneldesk
+Icon=tunneldesk
+Terminal=false
+Type=Application
+Categories=Network;Development;
+Keywords=cloudflare;tunnel;proxy;network;
+StartupNotify=true

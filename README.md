@@ -27,7 +27,7 @@ A local HTTP proxy for Cloudflare Tunnels with request inspection and WebSocket 
 
 ### Pre-built binaries
 
-For MacOS and Windows, pre-built binaries are available from the [releases](https://github.com/heiko-r/tunneldesk/releases).
+For Ubuntu, MacOS and Windows, pre-built binaries are available from the [releases](https://github.com/heiko-r/tunneldesk/releases).
 
 ### Linux dependencies (for the native GUI window)
 
