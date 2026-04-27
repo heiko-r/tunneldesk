@@ -58,7 +58,14 @@ Pass the path to the `config.toml` via the `--config` flag when running the appl
 - macOS: `~/Library/Application Support/TunnelDesk/config.toml`
 - Windows: `%APPDATA%\TunnelDesk\config.toml`
 
-To use TunnelDesk to manage your tunnels on the Cloudflare side too, you need to, as a minimum, provide the Cloudflare API token, account ID, zone ID, and tunnel name. The first three, you can get from the Cloudflare Dashboard. The tunnel name can be any string to use as the tunnel identifier in Cloudflare. If `cloudflared` is already set up and linked to your account, you can provide the tunnel ID and token directly in the configuration file.
+To use TunnelDesk to manage your tunnels on the Cloudflare side too, you need to, as a minimum, provide the Cloudflare API token, account ID, zone ID, and tunnel name. The first three, you can get from the Cloudflare Dashboard.
+
+The token needs permission to:
+- Edit DNS
+- Edit cache settings
+- Edit Cloudflare One Connector: cloudflared
+
+The tunnel name can be any string to use as the tunnel identifier in Cloudflare. If `cloudflared` is already set up and linked to your account, you can provide the tunnel ID and token directly in the configuration file.
 
 Tunnels can be created later via the GUI.
 
