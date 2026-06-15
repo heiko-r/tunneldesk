@@ -3,9 +3,8 @@ use crate::storage::{
     WebSocketMessageType,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 /// Verbosity of stdout logging for captured traffic.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,20 +35,63 @@ impl std::fmt::Display for LogLevel {
     }
 }
 
-/// Parses and stores captured proxy traffic.
+/// An event sent from the proxy hot-path to the background [`CaptureWorker`].
 ///
-/// Each [`Proxy`](crate::proxy::Proxy) instance owns a `Capture` that receives raw
-/// bytes from both directions of a TCP connection, identifies HTTP request/response
-/// messages and WebSocket frames, and persists them to the shared storage.
+/// Using raw bytes here keeps the enum `Send + 'static` and avoids any
+/// parsing work inside `poll_read` – all parsing happens in the worker.
+#[derive(Debug)]
+pub enum CaptureEvent {
+    /// Raw bytes of a complete HTTP request or response, ready to be parsed
+    /// and stored.
+    HttpMessage {
+        tunnel_name: String,
+        connection_id: String,
+        direction: String,
+        raw: Vec<u8>,
+    },
+    /// A complete WebSocket frame (header + payload) ready to be decoded and
+    /// stored.
+    WebSocketFrame {
+        tunnel_name: String,
+        connection_id: String,
+        direction: String,
+        raw_frame: Vec<u8>,
+    },
+}
+
+/// Capacity of the bounded channel between the proxy hot-path and the capture
+/// worker.  Large enough to absorb bursts (e.g. a React app loading dozens of
+/// assets in parallel) without back-pressuring the proxy.
+const CAPTURE_CHANNEL_CAPACITY: usize = 4096;
+
+/// Lightweight handle to the capture pipeline.
+///
+/// `Capture` is cheap to clone – it only holds the sender half of a bounded
+/// `mpsc` channel, a log level, and a body-size limit.  All heavy work
+/// (parsing, lock acquisition, storage writes) happens in the background
+/// [`CaptureWorker`] task.
+///
+/// If the channel is full (the worker is temporarily overloaded), events are
+/// dropped with a warning log rather than blocking the proxy I/O path.
 #[derive(Clone)]
 pub struct Capture {
+    sender: mpsc::Sender<CaptureEvent>,
+}
+
+/// Background task that owns the storage and processes [`CaptureEvent`]s.
+///
+/// Spawn this with [`CaptureWorker::run`] before creating any [`Capture`]
+/// handles.  The worker stops when all `Capture` senders are dropped (i.e.
+/// when the channel is closed).
+pub struct CaptureWorker {
     pub storage: RequestStorage,
     pub websocket_storage: WebSocketMessageStorage,
     log_level: LogLevel,
-    /// Maximum body bytes to print when `log_level` is `Full`.
     log_body_limit: usize,
-    // Track WebSocket upgrade requests per connection
-    websocket_upgrades: Arc<RwLock<HashMap<String, String>>>, // connection_id -> request_id
+    /// Per-connection map from connection_id to the ID of the WebSocket upgrade
+    /// request, used to link WS frames back to their HTTP upgrade.
+    websocket_upgrades: HashMap<String, String>,
+    receiver: mpsc::Receiver<CaptureEvent>,
 }
 
 /// HTTP method tokens to identify request lines.
@@ -118,7 +160,10 @@ fn is_websocket_upgrade(headers: &HashMap<String, String>) -> bool {
 }
 
 impl Capture {
-    /// Creates a new `Capture`.
+    /// Creates a new `Capture` handle and the corresponding [`CaptureWorker`].
+    ///
+    /// Callers must [`CaptureWorker::run`] the returned worker on a background
+    /// task before any events can be processed.
     ///
     /// * `stdout_level` — parsed by [`LogLevel::from`]; unknown values default to `"basic"`.
     /// * `log_body_limit` — maximum body bytes written to stdout in `full` mode.
@@ -127,24 +172,136 @@ impl Capture {
         websocket_storage: WebSocketMessageStorage,
         stdout_level: &str,
         log_body_limit: usize,
-    ) -> Self {
-        Self {
+    ) -> (Self, CaptureWorker) {
+        let log_level = LogLevel::from(stdout_level);
+        let (sender, receiver) = mpsc::channel(CAPTURE_CHANNEL_CAPACITY);
+        let handle = Self { sender };
+        let worker = CaptureWorker {
             storage: request_storage,
             websocket_storage,
-            log_level: LogLevel::from(stdout_level),
+            log_level,
             log_body_limit,
-            websocket_upgrades: Arc::new(RwLock::new(HashMap::new())),
+            websocket_upgrades: HashMap::new(),
+            receiver,
+        };
+        (handle, worker)
+    }
+
+    /// Enqueues a raw HTTP message for background capture.
+    ///
+    /// This is non-blocking: if the channel is full the event is dropped and a
+    /// log message is emitted.  Proxy throughput is never sacrificed.
+    pub fn enqueue_http_message(
+        &self,
+        tunnel_name: String,
+        connection_id: String,
+        direction: String,
+        raw: Vec<u8>,
+    ) {
+        match self.sender.try_send(CaptureEvent::HttpMessage {
+            tunnel_name,
+            connection_id,
+            direction,
+            raw,
+        }) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Capture channel full – dropping HTTP message");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Capture channel closed – dropping HTTP message");
+            }
+        }
+    }
+
+    /// Enqueues a raw WebSocket frame for background capture.
+    ///
+    /// Non-blocking; see [`enqueue_http_message`](Self::enqueue_http_message).
+    pub fn enqueue_websocket_frame(
+        &self,
+        tunnel_name: String,
+        connection_id: String,
+        direction: String,
+        raw_frame: Vec<u8>,
+    ) {
+        match self.sender.try_send(CaptureEvent::WebSocketFrame {
+            tunnel_name,
+            connection_id,
+            direction,
+            raw_frame,
+        }) {
+            Ok(_) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Capture channel full – dropping WebSocket frame");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Capture channel closed – dropping WebSocket frame");
+            }
+        }
+    }
+
+    /// Returns a body preview string (used in logging).
+    pub fn body_preview_pub(body: &[u8], limit: usize) -> String {
+        Self::body_preview(body, limit)
+    }
+
+    /// Returns a UTF-8 lossy representation of `body` truncated to `limit`
+    /// bytes, with a `...` suffix when truncated.
+    fn body_preview(body: &[u8], limit: usize) -> String {
+        if body.len() <= limit {
+            String::from_utf8_lossy(body).into_owned()
+        } else {
+            format!("{}...", String::from_utf8_lossy(&body[..limit]))
+        }
+    }
+}
+
+impl CaptureWorker {
+    /// Runs the capture worker until all [`Capture`] sender handles are dropped.
+    ///
+    /// Call this inside a `tokio::spawn` or similar before creating connections.
+    pub async fn run(mut self) {
+        while let Some(event) = self.receiver.recv().await {
+            match event {
+                CaptureEvent::HttpMessage {
+                    tunnel_name,
+                    connection_id,
+                    direction,
+                    raw,
+                } => {
+                    if let Err(e) = self
+                        .process_http_message(&tunnel_name, &connection_id, &direction, &raw)
+                        .await
+                    {
+                        warn!("Failed to capture HTTP message: {}", e);
+                    }
+                }
+                CaptureEvent::WebSocketFrame {
+                    tunnel_name,
+                    connection_id,
+                    direction,
+                    raw_frame,
+                } => {
+                    if let Err(e) = self
+                        .process_websocket_frame(
+                            &tunnel_name,
+                            &connection_id,
+                            &direction,
+                            &raw_frame,
+                        )
+                        .await
+                    {
+                        warn!("Failed to capture WebSocket frame: {}", e);
+                    }
+                }
+            }
         }
     }
 
     /// Classifies `raw_message` as an HTTP request, HTTP response, or raw binary
     /// data, then logs and stores it accordingly.
-    ///
-    /// * `connection_id` — opaque identifier for the TCP connection; used to
-    ///   match responses to their requests.
-    /// * `direction` — human-readable direction string used in raw-message logs.
-    pub async fn capture_raw_message(
-        &self,
+    async fn process_http_message(
+        &mut self,
         tunnel_name: &str,
         connection_id: &str,
         direction: &str,
@@ -160,7 +317,7 @@ impl Capture {
                     .await;
             } else if first_line.starts_with("HTTP/") {
                 return self
-                    .capture_http_response(tunnel_name, connection_id, &lines, raw_message)
+                    .capture_http_response(tunnel_name, connection_id, direction, raw_message)
                     .await;
             }
         }
@@ -176,7 +333,7 @@ impl Capture {
     }
 
     async fn capture_http_request(
-        &self,
+        &mut self,
         tunnel_name: &str,
         connection_id: &str,
         lines: &[&str],
@@ -209,7 +366,7 @@ impl Capture {
                 info!(
                     "[{}] Body: {}",
                     tunnel_name,
-                    Self::body_preview(&body, self.log_body_limit)
+                    Capture::body_preview_pub(&body, self.log_body_limit)
                 );
             }
         }
@@ -227,8 +384,8 @@ impl Capture {
         };
 
         if is_websocket_upgrade(&headers) {
-            let mut upgrades = self.websocket_upgrades.write().await;
-            upgrades.insert(connection_id.to_string(), stored_request.id.clone());
+            self.websocket_upgrades
+                .insert(connection_id.to_string(), stored_request.id.clone());
             info!(
                 "[{}] WebSocket upgrade detected - request_id: {}, connection_id: {}",
                 tunnel_name, stored_request.id, connection_id
@@ -242,12 +399,14 @@ impl Capture {
     }
 
     async fn capture_http_response(
-        &self,
+        &mut self,
         tunnel_name: &str,
         connection_id: &str,
-        lines: &[&str],
+        _direction: &str,
         raw_message: &[u8],
     ) -> anyhow::Result<()> {
+        let message_str = String::from_utf8_lossy(raw_message);
+        let lines: Vec<&str> = message_str.lines().collect();
         let parts: Vec<&str> = lines[0].split_whitespace().collect();
         if parts.len() < 2 {
             return Ok(());
@@ -256,7 +415,7 @@ impl Capture {
             return Ok(());
         };
 
-        let (headers, body_start) = parse_http_headers(lines);
+        let (headers, body_start) = parse_http_headers(&lines);
         let body = extract_body_from_raw(raw_message, body_start < lines.len());
 
         match self.log_level {
@@ -275,7 +434,7 @@ impl Capture {
                 info!(
                     "[{}] Body: {}",
                     tunnel_name,
-                    Self::body_preview(&body, self.log_body_limit)
+                    Capture::body_preview_pub(&body, self.log_body_limit)
                 );
             }
         }
@@ -306,11 +465,10 @@ impl Capture {
         Ok(())
     }
 
-    /// Parses a raw WebSocket frame from `raw_frame`, unmasks the payload if
-    /// necessary, and stores it linked to the upgrade request for `connection_id`.
-    /// Returns `Ok(())` immediately when the frame is incomplete or too short.
-    pub async fn capture_websocket_message_raw(
-        &self,
+    /// Parses a raw WebSocket frame, unmasks the payload if necessary, and
+    /// stores it linked to the upgrade request for `connection_id`.
+    async fn process_websocket_frame(
+        &mut self,
         tunnel_name: &str,
         connection_id: &str,
         direction: &str,
@@ -361,20 +519,19 @@ impl Capture {
         let message_type = match opcode {
             0x1 => WebSocketMessageType::Text,
             0x2 => WebSocketMessageType::Binary,
-            _ => WebSocketMessageType::Binary, // Default for other opcodes including close
+            _ => WebSocketMessageType::Binary,
         };
 
-        // Store the WebSocket message
         let message_id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now();
 
-        // Get the upgrade request ID for this connection, if any
-        let upgrades = self.websocket_upgrades.read().await;
-        let upgrade_request_id = upgrades
+        // Look up the upgrade request ID for this connection (no lock needed – we
+        // own the HashMap in the worker).
+        let upgrade_request_id = self
+            .websocket_upgrades
             .get(connection_id)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        drop(upgrades); // Release the read lock
 
         let stored_message = StoredWebSocketMessage {
             id: message_id,
@@ -388,14 +545,14 @@ impl Capture {
 
         self.websocket_storage.store_message(stored_message).await;
 
-        // Log based on level
         match self.log_level {
             LogLevel::Off => {}
             LogLevel::Basic => {
                 info!("WS {} [{}]", direction, tunnel_name);
             }
             LogLevel::Full => {
-                let payload_preview = Self::body_preview(&unmasked_payload, self.log_body_limit);
+                let payload_preview =
+                    Capture::body_preview_pub(&unmasked_payload, self.log_body_limit);
                 info!(
                     "[{}] WS {} - opcode: {}, payload: {}",
                     tunnel_name, direction, opcode, payload_preview
@@ -405,15 +562,48 @@ impl Capture {
 
         Ok(())
     }
+}
 
-    /// Returns a UTF-8 lossy representation of `body` truncated to `limit`
-    /// bytes, with a `...` suffix when truncated.
-    fn body_preview(body: &[u8], limit: usize) -> String {
-        if body.len() <= limit {
-            String::from_utf8_lossy(body).into_owned()
-        } else {
-            format!("{}...", String::from_utf8_lossy(&body[..limit]))
+#[cfg(test)]
+impl CaptureWorker {
+    /// Constructs a standalone worker for unit tests (no channel sender needed).
+    pub fn new_for_testing(
+        storage: RequestStorage,
+        websocket_storage: WebSocketMessageStorage,
+        stdout_level: &str,
+        log_body_limit: usize,
+    ) -> Self {
+        let (_tx, rx) = mpsc::channel(1);
+        Self {
+            storage,
+            websocket_storage,
+            log_level: LogLevel::from(stdout_level),
+            log_body_limit,
+            websocket_upgrades: HashMap::new(),
+            receiver: rx,
         }
+    }
+
+    pub async fn test_process_http(
+        &mut self,
+        tunnel_name: &str,
+        connection_id: &str,
+        direction: &str,
+        raw: &[u8],
+    ) -> anyhow::Result<()> {
+        self.process_http_message(tunnel_name, connection_id, direction, raw)
+            .await
+    }
+
+    pub async fn test_process_ws(
+        &mut self,
+        tunnel_name: &str,
+        connection_id: &str,
+        direction: &str,
+        raw_frame: &[u8],
+    ) -> anyhow::Result<()> {
+        self.process_websocket_frame(tunnel_name, connection_id, direction, raw_frame)
+            .await
     }
 }
 
@@ -444,50 +634,50 @@ mod tests {
     fn test_capture_new() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "full", 1024);
-        assert!(matches!(capture.log_level, LogLevel::Full));
-        assert_eq!(capture.log_body_limit, 1024);
+        let (_handle, worker) = Capture::new(storage, websocket_storage, "full", 1024);
+        assert!(matches!(worker.log_level, LogLevel::Full));
+        assert_eq!(worker.log_body_limit, 1024);
     }
 
     #[test]
     fn test_body_preview_below_limit() {
-        assert_eq!(Capture::body_preview(b"hello", 10), "hello");
+        assert_eq!(Capture::body_preview_pub(b"hello", 10), "hello");
     }
 
     #[test]
     fn test_body_preview_at_limit() {
-        assert_eq!(Capture::body_preview(b"hello", 5), "hello");
+        assert_eq!(Capture::body_preview_pub(b"hello", 5), "hello");
     }
 
     #[test]
     fn test_body_preview_exceeds_limit() {
-        assert_eq!(Capture::body_preview(b"hello world", 5), "hello...");
+        assert_eq!(Capture::body_preview_pub(b"hello world", 5), "hello...");
     }
 
     #[test]
     fn test_body_preview_empty() {
-        assert_eq!(Capture::body_preview(b"", 10), "");
+        assert_eq!(Capture::body_preview_pub(b"", 10), "");
     }
 
     #[test]
     fn test_body_preview_zero_limit() {
-        assert_eq!(Capture::body_preview(b"hello", 0), "...");
+        assert_eq!(Capture::body_preview_pub(b"hello", 0), "...");
     }
 
     #[tokio::test]
     async fn test_capture_raw_message_get_request() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\nContent-Type: application/json\r\n\r\n{\"key\":\"value\"}";
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", raw_message)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", raw_message)
             .await;
         assert!(result.is_ok());
 
         // Check that the request was stored
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.method, "GET");
@@ -508,15 +698,15 @@ mod tests {
     async fn test_capture_raw_message_post_request() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"POST /api/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 12\r\n\r\nHello World!";
 
-        let result = capture
-            .capture_raw_message("api_tunnel", "test-connection", "outgoing", raw_message)
+        let result = worker
+            .test_process_http("api_tunnel", "test-connection", "outgoing", raw_message)
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.method, "POST");
@@ -528,17 +718,17 @@ mod tests {
     async fn test_capture_raw_message_http_response() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\n\r\n{\"success\":true}";
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", raw_message)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", raw_message)
             .await;
         assert!(result.is_ok());
 
         // Responses are stored separately, not as part of request exchanges
         // Let's check if there are any requests (should be 0 for response-only)
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 0);
 
         // The response was stored but we can't easily access it directly through the public API
@@ -549,16 +739,16 @@ mod tests {
     async fn test_capture_raw_message_invalid_http() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"Invalid HTTP message";
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", raw_message)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", raw_message)
             .await;
         assert!(result.is_ok());
 
         // Should not store any requests
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 0);
     }
 
@@ -566,16 +756,16 @@ mod tests {
     async fn test_capture_raw_message_empty() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"";
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", raw_message)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", raw_message)
             .await;
         assert!(result.is_ok());
 
         // Should not store any requests
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 0);
     }
 
@@ -583,15 +773,15 @@ mod tests {
     async fn test_capture_raw_message_request_without_body() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let raw_message = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", raw_message)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", raw_message)
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.method, "GET");
@@ -602,7 +792,7 @@ mod tests {
     async fn test_capture_websocket_message_text() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a simple WebSocket text frame (unmasked, opcode 0x1)
         let mut frame = Vec::new();
@@ -610,12 +800,12 @@ mod tests {
         frame.push(0x10); // Payload length = 16 (for "Hello WebSocket!")
         frame.extend_from_slice(b"Hello WebSocket!");
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.tunnel_name, "ws_tunnel");
@@ -628,7 +818,7 @@ mod tests {
     async fn test_capture_websocket_message_binary() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a WebSocket binary frame (unmasked, opcode 0x2)
         let mut frame = Vec::new();
@@ -636,12 +826,12 @@ mod tests {
         frame.push(0x04); // Payload length = 4
         frame.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "incoming", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "incoming", &frame)
             .await;
         assert!(result.is_ok());
 
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.direction, "incoming");
@@ -653,7 +843,7 @@ mod tests {
     async fn test_capture_websocket_message_masked() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a masked WebSocket text frame (client-to-server)
         let mut frame = Vec::new();
@@ -670,12 +860,12 @@ mod tests {
             0x6F ^ 0x12,
         ]);
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.payload, b"Hello");
@@ -685,16 +875,16 @@ mod tests {
     async fn test_capture_websocket_message_too_short() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let frame = vec![0x81]; // Incomplete frame
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
         // Should not store any messages
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 0);
     }
 
@@ -702,7 +892,7 @@ mod tests {
     async fn test_capture_websocket_message_incomplete_payload() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Frame header indicates 10 bytes but only provides 5
         let mut frame = Vec::new();
@@ -710,13 +900,13 @@ mod tests {
         frame.push(0x0A); // Payload length = 10
         frame.extend_from_slice(b"Hello"); // Only 5 bytes of payload
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
         // Should not store any messages
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 0);
     }
 
@@ -724,7 +914,7 @@ mod tests {
     async fn test_capture_websocket_message_extended_payload_length() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a frame with 126-byte payload length (2-byte extended length)
         let mut frame = Vec::new();
@@ -733,12 +923,12 @@ mod tests {
         frame.extend_from_slice(&[0x00, 0x7E]); // Extended payload length = 126
         frame.extend_from_slice(&[0x42; 126]); // 126 bytes of payload
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].payload.len(), 126);
     }
@@ -747,7 +937,7 @@ mod tests {
     async fn test_capture_websocket_message_unknown_opcode() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a frame with unknown opcode (should default to Binary)
         let mut frame = Vec::new();
@@ -755,12 +945,12 @@ mod tests {
         frame.push(0x02); // Payload length = 2
         frame.extend_from_slice(&[0x03, 0xE8]); // Close code 1000
 
-        let result = capture
-            .capture_websocket_message_raw("ws_tunnel", "test-connection", "outgoing", &frame)
+        let result = worker
+            .test_process_ws("ws_tunnel", "test-connection", "outgoing", &frame)
             .await;
         assert!(result.is_ok());
 
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         // Unknown opcodes should default to Binary
         assert!(matches!(
@@ -776,11 +966,12 @@ mod tests {
         for method in methods.iter() {
             let storage = RequestStorage::new(100);
             let websocket_storage = WebSocketMessageStorage::new(1000);
-            let capture = Capture::new(storage, websocket_storage, "off", 1024);
+            let mut worker =
+                CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
             let raw_message = format!("{} /test HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
 
-            let result = capture
-                .capture_raw_message(
+            let result = worker
+                .test_process_http(
                     "test_tunnel",
                     "test-connection",
                     "incoming",
@@ -796,13 +987,13 @@ mod tests {
     async fn test_storage_limits() {
         let storage = RequestStorage::new(2);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024); // Very small storage limit
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024); // Very small storage limit
 
         // Store 3 requests
         for i in 0..3 {
             let raw_message = format!("GET /test{} HTTP/1.1\r\nHost: example.com\r\n\r\n", i);
-            capture
-                .capture_raw_message(
+            worker
+                .test_process_http(
                     "test_tunnel",
                     "test-connection",
                     "incoming",
@@ -813,7 +1004,7 @@ mod tests {
         }
 
         // Should only keep the 2 most recent requests
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 2);
     }
 
@@ -821,31 +1012,31 @@ mod tests {
     async fn test_websocket_upgrade_tracking() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let connection_id = "test-connection-ws";
 
         // First, capture a WebSocket upgrade request
         let upgrade_request = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
 
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "→", upgrade_request)
+        worker
+            .test_process_http("test_tunnel", connection_id, "→", upgrade_request)
             .await
             .unwrap();
 
         // Verify the upgrade request was stored
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let upgrade_request_id = &requests[0].request.id;
 
         // Now capture WebSocket messages on the same connection
         let ws_frame = b"\x81\x05Hello"; // Unmasked text frame
-        capture
-            .capture_websocket_message_raw("test_tunnel", connection_id, "outgoing", ws_frame)
+        worker
+            .test_process_ws("test_tunnel", connection_id, "outgoing", ws_frame)
             .await
             .unwrap();
 
         // Verify the WebSocket message has the correct upgrade_request_id
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.upgrade_request_id, *upgrade_request_id);
@@ -857,18 +1048,18 @@ mod tests {
     async fn test_websocket_message_without_upgrade() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let connection_id = "test-connection-no-ws";
 
         // Capture WebSocket message without prior upgrade request
         let ws_frame = b"\x81\x05Hello"; // Unmasked text frame
-        capture
-            .capture_websocket_message_raw("test_tunnel", connection_id, "outgoing", ws_frame)
+        worker
+            .test_process_ws("test_tunnel", connection_id, "outgoing", ws_frame)
             .await
             .unwrap();
 
         // Verify the WebSocket message has "unknown" upgrade_request_id
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.upgrade_request_id, "unknown");
@@ -880,25 +1071,25 @@ mod tests {
     async fn test_non_websocket_upgrade_request() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
         let connection_id = "test-connection-http";
 
         // Capture a regular HTTP request (not WebSocket upgrade)
         let regular_request = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "→", regular_request)
+        worker
+            .test_process_http("test_tunnel", connection_id, "→", regular_request)
             .await
             .unwrap();
 
         // Now capture WebSocket messages on the same connection
         let ws_frame = b"\x81\x05Hello"; // Unmasked text frame
-        capture
-            .capture_websocket_message_raw("test_tunnel", connection_id, "outgoing", ws_frame)
+        worker
+            .test_process_ws("test_tunnel", connection_id, "outgoing", ws_frame)
             .await
             .unwrap();
 
         // Verify the WebSocket message has "unknown" upgrade_request_id
-        let messages = capture.websocket_storage.get_all_messages().await;
+        let messages = worker.websocket_storage.get_all_messages().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.upgrade_request_id, "unknown");
@@ -914,22 +1105,23 @@ mod connection_tests {
     async fn test_connection_based_request_response_matching() {
         let storage = RequestStorage::new(100);
         let websocket_storage = crate::storage::WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage.clone(), websocket_storage, "off", 1024);
+        let mut worker =
+            CaptureWorker::new_for_testing(storage.clone(), websocket_storage, "off", 1024);
 
         let connection_id = "test-connection-1";
 
         // Store a request
         let request_data = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "→", request_data)
+        worker
+            .test_process_http("test_tunnel", connection_id, "→", request_data)
             .await
             .unwrap();
 
         // Store a response - should be matched to the request
         let response_data =
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"users\":[]}";
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "←", response_data)
+        worker
+            .test_process_http("test_tunnel", connection_id, "←", response_data)
             .await
             .unwrap();
 
@@ -951,7 +1143,8 @@ mod connection_tests {
     async fn test_multiple_requests_same_connection_fifo_ordering() {
         let storage = RequestStorage::new(100);
         let websocket_storage = crate::storage::WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage.clone(), websocket_storage, "off", 1024);
+        let mut worker =
+            CaptureWorker::new_for_testing(storage.clone(), websocket_storage, "off", 1024);
 
         let connection_id = "test-connection-2";
 
@@ -959,12 +1152,12 @@ mod connection_tests {
         let req1 = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let req2 = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\n\r\n{\"data\":\"value\"}";
 
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "→", req1)
+        worker
+            .test_process_http("test_tunnel", connection_id, "→", req1)
             .await
             .unwrap();
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "→", req2)
+        worker
+            .test_process_http("test_tunnel", connection_id, "→", req2)
             .await
             .unwrap();
 
@@ -972,12 +1165,12 @@ mod connection_tests {
         let resp1 = b"HTTP/1.1 200 OK\r\n\r\n{\"users\":[]}";
         let resp2 = b"HTTP/1.1 201 Created\r\n\r\n{\"id\":123}";
 
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "←", resp1)
+        worker
+            .test_process_http("test_tunnel", connection_id, "←", resp1)
             .await
             .unwrap();
-        capture
-            .capture_raw_message("test_tunnel", connection_id, "←", resp2)
+        worker
+            .test_process_http("test_tunnel", connection_id, "←", resp2)
             .await
             .unwrap();
 
@@ -1006,7 +1199,8 @@ mod connection_tests {
     async fn test_different_connections_independent_matching() {
         let storage = RequestStorage::new(100);
         let websocket_storage = crate::storage::WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage.clone(), websocket_storage, "off", 1024);
+        let mut worker =
+            CaptureWorker::new_for_testing(storage.clone(), websocket_storage, "off", 1024);
 
         let conn1 = "connection-1";
         let conn2 = "connection-2";
@@ -1015,12 +1209,12 @@ mod connection_tests {
         let req1 = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let req2 = b"GET /api/posts HTTP/1.1\r\nHost: example.com\r\n\r\n";
 
-        capture
-            .capture_raw_message("test_tunnel", conn1, "→", req1)
+        worker
+            .test_process_http("test_tunnel", conn1, "→", req1)
             .await
             .unwrap();
-        capture
-            .capture_raw_message("test_tunnel", conn2, "→", req2)
+        worker
+            .test_process_http("test_tunnel", conn2, "→", req2)
             .await
             .unwrap();
 
@@ -1028,12 +1222,12 @@ mod connection_tests {
         let resp1 = b"HTTP/1.1 200 OK\r\n\r\n{\"users\":[]}";
         let resp2 = b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"Not found\"}";
 
-        capture
-            .capture_raw_message("test_tunnel", conn2, "←", resp2)
+        worker
+            .test_process_http("test_tunnel", conn2, "←", resp2)
             .await
             .unwrap(); // Response for conn2
-        capture
-            .capture_raw_message("test_tunnel", conn1, "←", resp1)
+        worker
+            .test_process_http("test_tunnel", conn1, "←", resp1)
             .await
             .unwrap(); // Response for conn1
 
@@ -1064,7 +1258,7 @@ mod connection_tests {
     async fn test_capture_binary_request_body() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Create a binary request body (PNG image data)
         let png_header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x00\x01\x00\x01\x00\x00\x00\x00IEND\xaeB`\x82";
@@ -1076,12 +1270,12 @@ mod connection_tests {
         let mut full_request = raw_request.into_bytes();
         full_request.extend_from_slice(png_header);
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "outgoing", &full_request)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "outgoing", &full_request)
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
 
@@ -1110,12 +1304,12 @@ mod connection_tests {
     async fn test_capture_binary_response_body() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // First capture a request to have something to match the response to
         let request_data = b"GET /image.png HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        capture
-            .capture_raw_message("test_tunnel", "test-connection", "outgoing", request_data)
+        worker
+            .test_process_http("test_tunnel", "test-connection", "outgoing", request_data)
             .await
             .unwrap();
 
@@ -1129,13 +1323,13 @@ mod connection_tests {
         let mut full_response = raw_response.into_bytes();
         full_response.extend_from_slice(jpeg_header);
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "incoming", &full_response)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "incoming", &full_response)
             .await;
         assert!(result.is_ok());
 
         // Get the request exchange to check the response
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let exchange = &requests[0];
 
@@ -1167,7 +1361,7 @@ mod connection_tests {
     async fn test_capture_mixed_binary_text_data() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Test with mixed binary and text data that includes null bytes
         let mixed_data = b"Hello\x00\x01\x02World\xff\xfe\x03\x04End";
@@ -1179,12 +1373,12 @@ mod connection_tests {
         let mut full_request = raw_request.into_bytes();
         full_request.extend_from_slice(mixed_data);
 
-        let result = capture
-            .capture_raw_message("test_tunnel", "test-connection", "outgoing", &full_request)
+        let result = worker
+            .test_process_http("test_tunnel", "test-connection", "outgoing", &full_request)
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
 
@@ -1204,14 +1398,14 @@ mod connection_tests {
     async fn test_binary_body_with_different_line_endings() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let capture = Capture::new(storage, websocket_storage, "off", 1024);
+        let mut worker = CaptureWorker::new_for_testing(storage, websocket_storage, "off", 1024);
 
         // Test with \r\n\r\n line endings
         let binary_body = b"\x01\x02\x03\x04\x05";
         let request_with_crlf = b"POST /test HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\n\x01\x02\x03\x04\x05";
 
-        let result = capture
-            .capture_raw_message(
+        let result = worker
+            .test_process_http(
                 "test_tunnel",
                 "test-connection",
                 "outgoing",
@@ -1220,20 +1414,20 @@ mod connection_tests {
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.body, binary_body);
 
         // Clear storage for next test
-        capture.storage.clear().await;
+        worker.storage.clear().await;
 
         // Test with \n\n line endings
         let request_with_lf =
             b"POST /test HTTP/1.1\nHost: example.com\nContent-Length: 5\n\n\x01\x02\x03\x04\x05";
 
-        let result = capture
-            .capture_raw_message(
+        let result = worker
+            .test_process_http(
                 "test_tunnel",
                 "test-connection2",
                 "outgoing",
@@ -1242,7 +1436,7 @@ mod connection_tests {
             .await;
         assert!(result.is_ok());
 
-        let requests = capture.storage.get_all_requests().await;
+        let requests = worker.storage.get_all_requests().await;
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.body, binary_body);

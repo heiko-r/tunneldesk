@@ -2,10 +2,10 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -262,37 +262,21 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
     }
 
     fn dispatch_http_message(&self, message: Vec<u8>) {
-        tokio::spawn({
-            let capture = self.capture.clone();
-            let tunnel_name = self.tunnel_name.clone();
-            let connection_id = self.connection_id.clone();
-            let direction = self.direction.clone();
-            async move {
-                if let Err(e) = capture
-                    .capture_raw_message(&tunnel_name, &connection_id, &direction, &message)
-                    .await
-                {
-                    debug!("Failed to capture HTTP message: {}", e);
-                }
-            }
-        });
+        self.capture.enqueue_http_message(
+            self.tunnel_name.clone(),
+            self.connection_id.clone(),
+            self.direction.clone(),
+            message,
+        );
     }
 
     fn dispatch_websocket_frame(&self, frame: Vec<u8>) {
-        tokio::spawn({
-            let capture = self.capture.clone();
-            let tunnel_name = self.tunnel_name.clone();
-            let connection_id = self.connection_id.clone();
-            let direction = self.direction.clone();
-            async move {
-                if let Err(e) = capture
-                    .capture_websocket_message_raw(&tunnel_name, &connection_id, &direction, &frame)
-                    .await
-                {
-                    debug!("Failed to capture WebSocket frame: {}", e);
-                }
-            }
-        });
+        self.capture.enqueue_websocket_frame(
+            self.tunnel_name.clone(),
+            self.connection_id.clone(),
+            self.direction.clone(),
+            frame,
+        );
     }
 
     /// Returns `true` if `buf` starts with an HTTP method token or `HTTP/`.
@@ -434,13 +418,18 @@ impl Proxy {
         max_body_size: usize,
         log_body_limit: usize,
     ) -> Self {
+        let (capture, worker) = Capture::new(
+            (*request_storage).clone(),
+            (*websocket_storage).clone(),
+            stdout_level,
+            log_body_limit,
+        );
+        // Spawn the capture worker as a background task.  It will process all
+        // queued capture events until the last `Capture` sender is dropped (i.e.
+        // when this `Proxy` and all its connection tasks are gone).
+        tokio::spawn(worker.run());
         Self {
-            capture: Capture::new(
-                (*request_storage).clone(),
-                (*websocket_storage).clone(),
-                stdout_level,
-                log_body_limit,
-            ),
+            capture,
             config,
             max_body_size,
         }
@@ -567,12 +556,16 @@ impl Proxy {
             async {
                 let mut client_reader = client_to_server_tee;
                 let mut server_writer = tcp_writer;
-                tokio::io::copy(&mut client_reader, &mut server_writer).await
+                let res = tokio::io::copy(&mut client_reader, &mut server_writer).await;
+                let _ = server_writer.shutdown().await;
+                res
             },
             async {
                 let mut server_reader = server_to_client_tee;
                 let mut client_writer = unix_writer;
-                tokio::io::copy(&mut server_reader, &mut client_writer).await
+                let res = tokio::io::copy(&mut server_reader, &mut client_writer).await;
+                let _ = client_writer.shutdown().await;
+                res
             }
         );
 
@@ -757,12 +750,13 @@ mod tests {
     fn make_capture() -> (Capture, Arc<crate::storage::RequestStorage>) {
         let storage = Arc::new(crate::storage::RequestStorage::new(100));
         let websocket_storage = Arc::new(crate::storage::WebSocketMessageStorage::new(1000));
-        let capture = Capture::new(
+        let (capture, worker) = Capture::new(
             (*storage).clone(),
             (*websocket_storage).clone(),
             "debug",
             1024,
         );
+        tokio::spawn(worker.run());
         (capture, storage)
     }
 
@@ -1314,8 +1308,8 @@ mod tests {
 
     // ── Proxy struct ──────────────────────────────────────────────────────
 
-    #[test]
-    fn test_proxy_creation() {
+    #[tokio::test]
+    async fn test_proxy_creation() {
         let config = TunnelConfig {
             name: "test_tunnel".to_string(),
             domain: "test.tunnel.example.com".to_string(),
