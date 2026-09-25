@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod app_service;
 mod capture;
 mod cloudflare;
 mod cloudflared;
@@ -206,28 +207,22 @@ pub(crate) async fn init_app(
         ))
     };
 
-    // Create and start web server.
-    // Clone tunnel_sync so the MCP server (when enabled) can share the same
-    // Cloudflare sync handle without requiring a second Arc.
-    let web_server = WebServer::new(
+    // Create AppService instance.
+    let app_service = Arc::new(crate::app_service::AppService::new(
         shared_config.clone(),
         tunnel_manager.clone(),
         tunnel_sync.clone(),
         request_storage.clone(),
         websocket_storage.clone(),
-    );
+    ));
+
+    // Create and start web server.
+    let web_server = WebServer::new(app_service.clone());
 
     // Start MCP stdio server when requested (feature-gated).
     #[cfg(feature = "mcp")]
     if args.mcp {
-        let mcp_tunnel_sync = tunnel_sync.clone();
-        let mcp_server = mcp::TunnelDeskMcp::new(
-            shared_config.clone(),
-            tunnel_manager.clone(),
-            mcp_tunnel_sync,
-            request_storage.clone(),
-            websocket_storage.clone(),
-        );
+        let mcp_server = mcp::TunnelDeskMcp::new(app_service.clone());
         tokio::spawn(async move {
             use rmcp::ServiceExt as _;
             match mcp_server.serve(rmcp::transport::io::stdio()).await {

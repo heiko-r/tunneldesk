@@ -17,18 +17,11 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
-use crate::config::Config;
-use crate::storage::{
-    QueryFilter, RequestStorage, StatusFilter, WebSocketMessageFilter, WebSocketMessageStorage,
+use crate::app_service::{
+    AppService, CreateTunnelRequest, DeleteTunnelRequest, ReplayRequestPayload, UpdateTunnelRequest,
 };
-use crate::sync::TunnelSync;
-use crate::tunnel::TunnelManager;
-use crate::web_server::{
-    CreateTunnelRequest, DeleteTunnelRequest, ReplayRequestPayload, UpdateTunnelRequest, WebServer,
-    WebSocketResponse,
-};
+use crate::storage::{QueryFilter, StatusFilter, WebSocketMessageFilter};
 
 // ── Tool parameter types ──────────────────────────────────────────────────────
 
@@ -180,49 +173,23 @@ fn bytes_to_display(bytes: &[u8]) -> String {
     }
 }
 
-/// Serialises a `WebSocketResponse` to pretty JSON for LLM-friendly display.
-fn format_response(response: &WebSocketResponse) -> String {
-    serde_json::to_string_pretty(response).unwrap_or_else(|e| format!("serialization error: {e}"))
-}
-
 // ── MCP server struct ─────────────────────────────────────────────────────────
 
 /// The TunnelDesk MCP server.
 ///
-/// Holds a `WebServer` clone (for reusing tunnel CRUD and replay logic) plus
-/// direct references to the shared storages for efficient query operations.
+/// Holds an `AppService` reference for tunnel CRUD and query operations.
 #[derive(Clone)]
 pub struct TunnelDeskMcp {
     tool_router: ToolRouter<TunnelDeskMcp>,
-    /// Used for tunnel CRUD and request-replay operations.
-    web_server: WebServer,
-    config: Arc<RwLock<Config>>,
-    request_storage: Arc<RequestStorage>,
-    websocket_storage: Arc<WebSocketMessageStorage>,
+    pub(crate) app_service: Arc<AppService>,
 }
 
 #[tool_router]
 impl TunnelDeskMcp {
-    pub fn new(
-        config: Arc<RwLock<Config>>,
-        tunnel_manager: Arc<TunnelManager>,
-        tunnel_sync: Option<Arc<TunnelSync>>,
-        request_storage: Arc<RequestStorage>,
-        websocket_storage: Arc<WebSocketMessageStorage>,
-    ) -> Self {
-        let web_server = WebServer::new(
-            config.clone(),
-            tunnel_manager,
-            tunnel_sync,
-            request_storage.clone(),
-            websocket_storage.clone(),
-        );
+    pub fn new(app_service: Arc<AppService>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            web_server,
-            config,
-            request_storage,
-            websocket_storage,
+            app_service,
         }
     }
 
@@ -232,7 +199,7 @@ impl TunnelDeskMcp {
         description = "List all configured tunnels with their name, domain, target port, socket path, and enabled status."
     )]
     async fn list_tunnels(&self) -> Result<CallToolResult, McpError> {
-        let cfg = self.config.read().await;
+        let cfg = self.app_service.config.read().await;
         let tunnels: Vec<TunnelSummary> = cfg
             .tunnels
             .iter()
@@ -262,10 +229,15 @@ impl TunnelDeskMcp {
             socket_path: p.socket_path,
             target_port: p.target_port,
         };
-        let response = self.web_server.handle_create_tunnel(req).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            format_response(&response),
-        )]))
+        match self.app_service.create_tunnel(req).await {
+            Ok(info) => {
+                let json = serde_json::to_string_pretty(&info).unwrap();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
     }
 
     #[tool(
@@ -282,10 +254,15 @@ impl TunnelDeskMcp {
             target_port: p.target_port,
             enabled: p.enabled,
         };
-        let response = self.web_server.handle_update_tunnel(req).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            format_response(&response),
-        )]))
+        match self.app_service.update_tunnel(req).await {
+            Ok(info) => {
+                let json = serde_json::to_string_pretty(&info).unwrap();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
     }
 
     #[tool(
@@ -296,10 +273,15 @@ impl TunnelDeskMcp {
         Parameters(p): Parameters<DeleteTunnelParams>,
     ) -> Result<CallToolResult, McpError> {
         let req = DeleteTunnelRequest { name: p.name };
-        let response = self.web_server.handle_delete_tunnel(req).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            format_response(&response),
-        )]))
+        match self.app_service.delete_tunnel(req).await {
+            Ok(resp) => {
+                let json = serde_json::to_string_pretty(&resp).unwrap();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
     }
 
     // ── Request inspection ────────────────────────────────────────────────────
@@ -319,7 +301,11 @@ impl TunnelDeskMcp {
             ..Default::default()
         };
         let limit = p.limit.unwrap_or(20);
-        let mut exchanges = self.request_storage.query_requests(&filter).await;
+        let mut exchanges = self
+            .app_service
+            .request_storage
+            .query_requests(&filter)
+            .await;
         exchanges.truncate(limit);
 
         let summaries: Vec<RequestSummary> = exchanges
@@ -348,7 +334,12 @@ impl TunnelDeskMcp {
         &self,
         Parameters(p): Parameters<GetRequestParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.request_storage.get_request_by_id(&p.id).await {
+        match self
+            .app_service
+            .request_storage
+            .get_request_by_id(&p.id)
+            .await
+        {
             None => Ok(CallToolResult::success(vec![Content::text(format!(
                 "No request found with id '{}'",
                 p.id
@@ -390,7 +381,11 @@ impl TunnelDeskMcp {
             ..Default::default()
         };
         let limit = p.limit.unwrap_or(20);
-        let mut messages = self.websocket_storage.query_messages(&filter).await;
+        let mut messages = self
+            .app_service
+            .websocket_storage
+            .query_messages(&filter)
+            .await;
         messages.truncate(limit);
 
         let summaries: Vec<WsMessageSummary> = messages
@@ -420,7 +415,11 @@ impl TunnelDeskMcp {
         &self,
         Parameters(p): Parameters<ReplayRequestParams>,
     ) -> Result<CallToolResult, McpError> {
-        let exchange = self.request_storage.get_request_by_id(&p.id).await;
+        let exchange = self
+            .app_service
+            .request_storage
+            .get_request_by_id(&p.id)
+            .await;
         let req_data = match exchange {
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -440,10 +439,15 @@ impl TunnelDeskMcp {
             body: body_b64,
         };
 
-        let response = self.web_server.handle_replay_request(payload).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            format_response(&response),
-        )]))
+        match self.app_service.replay_request(payload).await {
+            Ok(resp) => {
+                let json = serde_json::to_string_pretty(&resp).unwrap();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
     }
 
     #[tool(
@@ -463,10 +467,15 @@ impl TunnelDeskMcp {
             body: body_b64,
         };
 
-        let response = self.web_server.handle_replay_request(payload).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            format_response(&response),
-        )]))
+        match self.app_service.replay_request(payload).await {
+            Ok(resp) => {
+                let json = serde_json::to_string_pretty(&resp).unwrap();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {e}"
+            ))])),
+        }
     }
 }
 
@@ -537,13 +546,14 @@ mod tests {
             request_storage.clone(),
             websocket_storage.clone(),
         ));
-        TunnelDeskMcp::new(
+        let app_service = Arc::new(AppService::new(
             config,
             tunnel_manager,
             None,
             request_storage,
             websocket_storage,
-        )
+        ));
+        TunnelDeskMcp::new(app_service)
     }
 
     fn make_tunnel(name: &str, port: u16) -> TunnelConfig {
@@ -620,10 +630,12 @@ mod tests {
     #[tokio::test]
     async fn query_requests_returns_stored_requests() {
         let mcp = test_mcp(vec![]);
-        mcp.request_storage
+        mcp.app_service
+            .request_storage
             .store_exchange(make_exchange("req-1", "api", "GET", "/users"))
             .await;
-        mcp.request_storage
+        mcp.app_service
+            .request_storage
             .store_exchange(make_exchange("req-2", "api", "POST", "/items"))
             .await;
 
@@ -646,7 +658,8 @@ mod tests {
     async fn query_requests_respects_limit() {
         let mcp = test_mcp(vec![]);
         for i in 0..10 {
-            mcp.request_storage
+            mcp.app_service
+                .request_storage
                 .store_exchange(make_exchange(&format!("req-{i}"), "api", "GET", "/path"))
                 .await;
         }
@@ -689,7 +702,10 @@ mod tests {
         let mcp = test_mcp(vec![]);
         let mut exchange = make_exchange("req-42", "api", "GET", "/health");
         exchange.request.body = b"request body".to_vec();
-        mcp.request_storage.store_exchange(exchange).await;
+        mcp.app_service
+            .request_storage
+            .store_exchange(exchange)
+            .await;
 
         let result = mcp
             .get_request(Parameters(GetRequestParams {
