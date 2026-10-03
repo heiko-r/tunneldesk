@@ -1,27 +1,33 @@
 use axum::{
-    Router,
+    Json, Router,
     body::Bytes,
     extract::{
-        State,
-        ws::{Message, WebSocketUpgrade},
+        Request, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{Uri, header},
-    response::{IntoResponse, Response},
-    routing::get,
+    http::{StatusCode, Uri, header},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use crate::app_service::{
     AppService, CloudflareStatusResponse, ConfirmRemoveHostsRequest, CreateTunnelRequest,
     DeleteTunnelRequest, ReplayRequestPayload, ReplayResponsePayload, RequestExchangeWithBase64,
-    StoredWebSocketMessageWithBase64, SyncReportResponse, TunnelDeletedResponse, TunnelInfo,
-    UnknownHostsFoundResponse, UpdateTunnelRequest, exchange_to_base64,
+    StoredWebSocketMessageWithBase64, SyncReportResponse, TunnelDeletedResponse, TunnelEvent,
+    TunnelInfo, UnknownHostsFoundResponse, UpdateTunnelRequest, exchange_to_base64,
     websocket_message_to_base64,
 };
-use crate::storage::{QueryFilter, WebSocketMessageFilter};
+use crate::core::ClientRegistry;
+use crate::security::{Decision, HEALTH_PATH, LOGIN_PAGE, SecurityPolicy};
+use crate::storage::{QueryFilter, RequestExchange, WebSocketMessageFilter};
 
 /// Commands sent by the browser over the GUI WebSocket connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +51,10 @@ pub enum WebSocketMessage {
     ReplayRequest(ReplayRequestPayload),
     // --- Request management ---
     ClearRequests(String),
+    // --- Core lifecycle ---
+    GetCoreStatus,
+    /// Stops the tunnels and the core for all attached frontends.
+    ShutdownCore,
 }
 
 /// Responses sent by the server over the GUI WebSocket connection.
@@ -59,7 +69,7 @@ pub enum WebSocketResponse {
     NewRequest(Box<RequestExchangeWithBase64>),
     /// Push notification for a newly stored WebSocket frame.
     NewWebSocketMessage(Box<StoredWebSocketMessageWithBase64>),
-    // --- CRUD responses ---
+    // --- CRUD responses (also pushed to every client on change) ---
     TunnelCreated(TunnelInfo),
     TunnelUpdated(TunnelInfo),
     TunnelDeleted(TunnelDeletedResponse),
@@ -70,7 +80,40 @@ pub enum WebSocketResponse {
     CloudflareStatus(CloudflareStatusResponse),
     // --- Replay ---
     ReplayResponse(ReplayResponsePayload),
+    // --- Core lifecycle ---
+    CoreStatus(CoreStatusResponse),
+    ShuttingDown,
     Error(String),
+}
+
+impl From<TunnelEvent> for WebSocketResponse {
+    fn from(event: TunnelEvent) -> Self {
+        match event {
+            TunnelEvent::Created(info) => Self::TunnelCreated(info),
+            TunnelEvent::Updated(info) => Self::TunnelUpdated(info),
+            TunnelEvent::Deleted(resp) => Self::TunnelDeleted(resp),
+        }
+    }
+}
+
+/// Information about the core process, pushed whenever attached clients change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreStatusResponse {
+    /// Number of attached frontends (UI connections and MCP bridges).
+    pub attached_clients: usize,
+    pub pid: u32,
+    pub port: u16,
+    pub config_path: String,
+    /// Seconds until an unused core exits; `None` for a foreground core.
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// Unauthenticated identity check used by frontends to find their core.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub config_hash: String,
+    pub version: String,
+    pub pid: u32,
 }
 
 #[derive(Embed)]
@@ -97,39 +140,169 @@ fn serve_asset(path: &str) -> Option<Response> {
     )
 }
 
-/// Serves the static web UI and handles GUI WebSocket connections.
+/// Everything the HTTP endpoint needs to know about the core it belongs to.
+#[derive(Clone)]
+pub struct ServerContext {
+    /// The port actually bound (resolved when `gui.port = 0`).
+    pub bound_port: u16,
+    pub access_token: String,
+    pub allowed_origins: Vec<String>,
+    pub config_path: PathBuf,
+    pub config_hash: String,
+    /// Cancelled to request a core shutdown.
+    pub shutdown: CancellationToken,
+    pub clients: Arc<ClientRegistry>,
+    /// Idle timeout of a background core; `None` for a foreground core.
+    pub idle_timeout: Option<Duration>,
+}
+
+impl ServerContext {
+    /// A context not tied to a running core, for handler tests.
+    #[cfg(test)]
+    pub fn standalone() -> Self {
+        Self {
+            bound_port: 0,
+            access_token: crate::config::generate_access_token(),
+            allowed_origins: Vec::new(),
+            config_path: PathBuf::new(),
+            config_hash: String::new(),
+            shutdown: CancellationToken::new(),
+            clients: ClientRegistry::new(),
+            idle_timeout: None,
+        }
+    }
+}
+
+/// Subscription state of a single GUI WebSocket connection.
+#[derive(Debug, Default)]
+struct ConnectionState {
+    filter: Option<QueryFilter>,
+}
+
+impl ConnectionState {
+    fn accepts(&self, exchange: &RequestExchange) -> bool {
+        self.filter.as_ref().is_none_or(|f| f.matches(exchange))
+    }
+}
+
+/// Serves the static web UI, the GUI WebSocket, the control API and MCP.
 #[derive(Clone)]
 pub struct WebServer {
     pub(crate) app_service: Arc<AppService>,
-    current_filter: Arc<RwLock<Option<QueryFilter>>>,
-    current_ws_filter: Arc<RwLock<Option<WebSocketMessageFilter>>>,
+    context: ServerContext,
+    policy: Arc<SecurityPolicy>,
 }
 
 impl WebServer {
-    /// Creates a new `WebServer`.
+    /// Creates a `WebServer` with a standalone context (not bound to a core).
+    #[cfg(test)]
     pub fn new(app_service: Arc<AppService>) -> Self {
+        Self::with_context(app_service, ServerContext::standalone())
+    }
+
+    pub fn with_context(app_service: Arc<AppService>, context: ServerContext) -> Self {
+        let policy = Arc::new(SecurityPolicy::new(
+            context.bound_port,
+            context.access_token.clone(),
+            &context.allowed_origins,
+        ));
         Self {
             app_service,
-            current_filter: Arc::new(RwLock::new(None)),
-            current_ws_filter: Arc::new(RwLock::new(None)),
+            context,
+            policy,
         }
     }
 
-    /// Binds to the configured port and serves the web UI and WebSocket API.
-    pub async fn start(&self) -> anyhow::Result<()> {
-        let app = Router::new()
+    /// Binds `127.0.0.1:port` and returns the listener with the actual port,
+    /// which differs from `port` when `port` is `0`.
+    pub async fn bind(port: u16) -> anyhow::Result<(TcpListener, u16)> {
+        use anyhow::Context as _;
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
+        let bound = listener.local_addr()?.port();
+        Ok((listener, bound))
+    }
+
+    /// Builds the router with the security layer in front of every route.
+    pub fn router(&self) -> Router {
+        let state = Arc::new(self.clone());
+        let router = Router::new()
             .route("/ws", get(websocket_handler))
+            .route(HEALTH_PATH, get(health_handler))
+            .route("/api/attach", get(attach_handler))
+            .route("/api/shutdown", post(shutdown_handler));
+        #[cfg(feature = "mcp")]
+        let router = router.nest_service(
+            "/mcp",
+            crate::mcp::http_service(
+                self.app_service.clone(),
+                self.context.shutdown.child_token(),
+            ),
+        );
+        router
             .fallback(serve_frontend)
-            .with_state(Arc::new(self.clone()));
+            .layer(middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state)
+    }
 
-        let port = self.app_service.config.read().await.gui.port;
-        let addr = format!("127.0.0.1:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-
-        tracing::info!("Web GUI server listening on http://{}", addr);
-
-        axum::serve(listener, app).await?;
+    /// Serves until the context's shutdown token is cancelled.
+    pub async fn serve(self, listener: TcpListener) -> anyhow::Result<()> {
+        let shutdown = self.context.shutdown.clone();
+        axum::serve(listener, self.router())
+            .with_graceful_shutdown(shutdown.cancelled_owned())
+            .await?;
         Ok(())
+    }
+
+    fn core_status(&self) -> CoreStatusResponse {
+        CoreStatusResponse {
+            attached_clients: self.context.clients.count(),
+            pid: std::process::id(),
+            port: self.context.bound_port,
+            config_path: self.context.config_path.to_string_lossy().into_owned(),
+            idle_timeout_secs: self.context.idle_timeout.map(|d| d.as_secs()),
+        }
+    }
+
+    async fn handle_message(
+        &self,
+        message: WebSocketMessage,
+        conn: &mut ConnectionState,
+    ) -> WebSocketResponse {
+        match message {
+            WebSocketMessage::ListTunnels => self.handle_list_tunnels().await,
+            WebSocketMessage::QueryRequests(filter) => self.handle_query_requests(&filter).await,
+            WebSocketMessage::QueryWebSocketMessages(filter) => {
+                self.handle_query_websocket_messages(&filter).await
+            }
+            WebSocketMessage::Subscribe(filter) => {
+                conn.filter = Some(filter);
+                WebSocketResponse::Requests(vec![])
+            }
+            WebSocketMessage::Unsubscribe => {
+                conn.filter = None;
+                WebSocketResponse::Requests(vec![])
+            }
+            WebSocketMessage::CreateTunnel(req) => self.handle_create_tunnel(req).await,
+            WebSocketMessage::UpdateTunnel(req) => self.handle_update_tunnel(req).await,
+            WebSocketMessage::DeleteTunnel(req) => self.handle_delete_tunnel(req).await,
+            WebSocketMessage::SyncTunnels => self.handle_sync_tunnels().await,
+            WebSocketMessage::ConfirmRemoveHosts(req) => {
+                self.handle_confirm_remove_hosts(req).await
+            }
+            WebSocketMessage::GetCloudflareStatus => self.handle_get_cloudflare_status().await,
+            WebSocketMessage::ReplayRequest(req) => self.handle_replay_request(req).await,
+            WebSocketMessage::ClearRequests(tunnel_name) => {
+                self.handle_clear_requests(tunnel_name).await
+            }
+            WebSocketMessage::GetCoreStatus => WebSocketResponse::CoreStatus(self.core_status()),
+            WebSocketMessage::ShutdownCore => {
+                tracing::info!("Shutdown requested from the UI");
+                self.context.shutdown.cancel();
+                WebSocketResponse::ShuttingDown
+            }
+        }
     }
 
     // ── Query handlers ────────────────────────────────────────────────────────
@@ -167,17 +340,6 @@ impl WebServer {
         let messages_with_base64: Vec<StoredWebSocketMessageWithBase64> =
             messages.iter().map(websocket_message_to_base64).collect();
         WebSocketResponse::WebSocketMessages(messages_with_base64)
-    }
-
-    async fn handle_subscribe(&self, filter: QueryFilter) -> WebSocketResponse {
-        *self.current_filter.write().await = Some(filter);
-        WebSocketResponse::Requests(vec![])
-    }
-
-    async fn handle_unsubscribe(&self) -> WebSocketResponse {
-        *self.current_filter.write().await = None;
-        *self.current_ws_filter.write().await = None;
-        WebSocketResponse::Requests(vec![])
     }
 
     // ── CRUD handlers ─────────────────────────────────────────────────────────
@@ -247,105 +409,134 @@ impl WebServer {
     }
 }
 
+/// Applies the [`SecurityPolicy`] to every request and records activity.
+async fn guard(State(server): State<Arc<WebServer>>, request: Request, next: Next) -> Response {
+    match server
+        .policy
+        .evaluate(request.method(), request.uri(), request.headers())
+    {
+        Decision::Allow { authenticated } => {
+            if authenticated {
+                server.context.clients.touch();
+            }
+            next.run(request).await
+        }
+        Decision::SetCookieAndEnter { cookie, location } => (
+            StatusCode::OK,
+            [
+                (header::SET_COOKIE, cookie),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            // A script navigation (instead of an HTTP redirect) starts on this
+            // origin, so the browser attaches the SameSite=Strict cookie.
+            Html(format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>TunnelDesk</title>\
+                 <script>location.replace({})</script></head><body></body></html>",
+                serde_json::to_string(&location).unwrap_or_else(|_| "\"/\"".to_string())
+            )),
+        )
+            .into_response(),
+        Decision::LoginPage => (StatusCode::UNAUTHORIZED, Html(LOGIN_PAGE)).into_response(),
+        Decision::Reject(status, message) => (status, message).into_response(),
+    }
+}
+
+async fn health_handler(State(server): State<Arc<WebServer>>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        config_hash: server.context.config_hash.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+    })
+}
+
+async fn shutdown_handler(State(server): State<Arc<WebServer>>) -> impl IntoResponse {
+    tracing::info!("Shutdown requested via API");
+    server.context.shutdown.cancel();
+    (StatusCode::ACCEPTED, "Shutting down")
+}
+
+/// Presence connection held by frontends without a UI WebSocket (MCP bridge).
+async fn attach_handler(ws: WebSocketUpgrade, State(server): State<Arc<WebServer>>) -> Response {
+    ws.on_upgrade(move |mut socket| async move {
+        let _guard = server.context.clients.attach();
+        let shutdown = server.context.shutdown.clone();
+        loop {
+            tokio::select! {
+                msg = socket.recv() => match msg {
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                },
+                _ = shutdown.cancelled() => {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+        }
+    })
+}
+
 async fn websocket_handler(ws: WebSocketUpgrade, State(server): State<Arc<WebServer>>) -> Response {
     ws.on_upgrade(|socket| websocket_connection(socket, server))
 }
 
-async fn websocket_connection(mut socket: axum::extract::ws::WebSocket, server: Arc<WebServer>) {
-    // Subscribe to request and WebSocket message broadcasts
+async fn send_response(socket: &mut WebSocket, response: &WebSocketResponse) -> bool {
+    match serde_json::to_string(response) {
+        Ok(text) => socket.send(Message::Text(text)).await.is_ok(),
+        Err(_) => true,
+    }
+}
+
+async fn websocket_connection(mut socket: WebSocket, server: Arc<WebServer>) {
+    let _guard = server.context.clients.attach();
+    let mut conn = ConnectionState::default();
     let mut request_receiver = server.app_service.request_storage.subscribe_requests();
     let mut ws_message_receiver = server.app_service.websocket_storage.subscribe_messages();
-    let current_filter = server.current_filter.clone();
+    let mut events = server.app_service.subscribe_events();
+    let mut connector = server.app_service.subscribe_connector();
+    let mut clients = server.context.clients.subscribe();
+    let shutdown = server.context.shutdown.clone();
 
     loop {
-        tokio::select! {
-            // Handle incoming WebSocket messages
-            Some(msg) = socket.recv() => {
-                if let Ok(msg) = msg {
-                    match msg {
-                        Message::Text(text) => {
-                            if let Ok(ws_message) = serde_json::from_str::<WebSocketMessage>(&text) {
-                                let response = match ws_message {
-                                    WebSocketMessage::ListTunnels => server.handle_list_tunnels().await,
-                                    WebSocketMessage::QueryRequests(filter) => {
-                                        server.handle_query_requests(&filter).await
-                                    }
-                                    WebSocketMessage::QueryWebSocketMessages(filter) => {
-                                        server.handle_query_websocket_messages(&filter).await
-                                    }
-                                    WebSocketMessage::Subscribe(filter) => {
-                                        server.handle_subscribe(filter).await
-                                    }
-                                    WebSocketMessage::Unsubscribe => server.handle_unsubscribe().await,
-                                    WebSocketMessage::CreateTunnel(req) => {
-                                        server.handle_create_tunnel(req).await
-                                    }
-                                    WebSocketMessage::UpdateTunnel(req) => {
-                                        server.handle_update_tunnel(req).await
-                                    }
-                                    WebSocketMessage::DeleteTunnel(req) => {
-                                        server.handle_delete_tunnel(req).await
-                                    }
-                                    WebSocketMessage::SyncTunnels => {
-                                        server.handle_sync_tunnels().await
-                                    }
-                                    WebSocketMessage::ConfirmRemoveHosts(req) => {
-                                        server.handle_confirm_remove_hosts(req).await
-                                    }
-                                    WebSocketMessage::GetCloudflareStatus => {
-                                        server.handle_get_cloudflare_status().await
-                                    }
-                                    WebSocketMessage::ReplayRequest(req) => {
-                                        server.handle_replay_request(req).await
-                                    }
-                                    WebSocketMessage::ClearRequests(tunnel_name) => {
-                                        server.handle_clear_requests(tunnel_name).await
-                                    }
-                                };
-
-                                if let Ok(response_text) = serde_json::to_string(&response) {
-                                    let _ = socket.send(Message::Text(response_text)).await;
-                                }
-                            } else {
-                                tracing::warn!("Could not parse WebSocket message: {text}");
-                            }
+        let response = tokio::select! {
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<WebSocketMessage>(&text) {
+                        Ok(message) => Some(server.handle_message(message, &mut conn).await),
+                        Err(_) => {
+                            tracing::warn!("Could not parse WebSocket message: {text}");
+                            None
                         }
-                        Message::Binary(binary) => {
-                            tracing::warn!("Received binary message: {:?}", binary);
-                        }
-                        _ => break, // Connection closed
-                    }
-                } else {
-                    break; // Connection error
-                }
-            }
-            // Handle broadcast request messages
-            Ok(exchange) = request_receiver.recv() => {
-                let filter = current_filter.read().await;
-
-                // Check if this exchange matches the current filter
-                let matches_filter = if let Some(ref filter) = *filter {
-                    filter.matches(&exchange)
-                } else {
-                    true // No filter means accept all
-                };
-
-                drop(filter); // Release the lock
-
-                if matches_filter {
-                    let response = WebSocketResponse::NewRequest(Box::new(exchange_to_base64(&exchange)));
-                    if let Ok(response_text) = serde_json::to_string(&response) {
-                        let _ = socket.send(Message::Text(response_text)).await;
                     }
                 }
-            }
-            // Handle broadcast WebSocket messages
-            Ok(ws_msg) = ws_message_receiver.recv() => {
-                let response = WebSocketResponse::NewWebSocketMessage(Box::new(websocket_message_to_base64(&ws_msg)));
-                if let Ok(response_text) = serde_json::to_string(&response) {
-                    let _ = socket.send(Message::Text(response_text)).await;
+                Some(Ok(Message::Binary(binary))) => {
+                    tracing::warn!("Received binary message: {:?}", binary);
+                    None
                 }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+            },
+            Ok(exchange) = request_receiver.recv() => conn
+                .accepts(&exchange)
+                .then(|| WebSocketResponse::NewRequest(Box::new(exchange_to_base64(&exchange)))),
+            Ok(ws_msg) = ws_message_receiver.recv() => Some(
+                WebSocketResponse::NewWebSocketMessage(Box::new(websocket_message_to_base64(&ws_msg)))
+            ),
+            Ok(event) = events.recv() => Some(event.into()),
+            Ok(()) = connector.changed() => Some(WebSocketResponse::CloudflareStatus(
+                server.app_service.get_cloudflare_status().await,
+            )),
+            Ok(()) = clients.changed() => Some(WebSocketResponse::CoreStatus(server.core_status())),
+            _ = shutdown.cancelled() => {
+                let _ = send_response(&mut socket, &WebSocketResponse::ShuttingDown).await;
+                let _ = socket.send(Message::Close(None)).await;
+                break;
             }
+        };
+
+        if let Some(response) = response
+            && !send_response(&mut socket, &response).await
+        {
+            break;
         }
     }
 }
@@ -365,6 +556,7 @@ mod tests {
     use crate::tunnel::TunnelManager;
     use base64::Engine as _;
     use std::collections::HashMap;
+    use tokio::sync::RwLock;
 
     fn make_config() -> Config {
         Config {
@@ -392,7 +584,8 @@ mod tests {
                 max_stored_requests: 100,
                 max_request_body_size: 1024 * 1024,
             },
-            gui: GuiConfig { port: 8080 },
+            gui: GuiConfig::with_port(8080),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         }
@@ -407,7 +600,7 @@ mod tests {
             req_storage.clone(),
             ws_storage.clone(),
         ));
-        let app_service = Arc::new(AppService::new(config, tm, None, req_storage, ws_storage));
+        let app_service = Arc::new(AppService::new(config, tm, req_storage, ws_storage));
         WebServer::new(app_service)
     }
 
@@ -561,13 +754,7 @@ mod tests {
             req_storage.clone(),
             ws_storage.clone(),
         ));
-        let app_service = Arc::new(AppService::new(
-            config,
-            tm,
-            None,
-            req_storage.clone(),
-            ws_storage,
-        ));
+        let app_service = Arc::new(AppService::new(config, tm, req_storage.clone(), ws_storage));
         let server = WebServer::new(app_service);
 
         let req = make_stored_request("r1", "tunnel-a", "GET", "/api");
@@ -596,13 +783,7 @@ mod tests {
             req_storage.clone(),
             ws_storage.clone(),
         ));
-        let app_service = Arc::new(AppService::new(
-            config,
-            tm,
-            None,
-            req_storage.clone(),
-            ws_storage,
-        ));
+        let app_service = Arc::new(AppService::new(config, tm, req_storage.clone(), ws_storage));
         let server = WebServer::new(app_service);
 
         // Store requests for different tunnels
@@ -738,13 +919,7 @@ mod tests {
             req_storage.clone(),
             ws_storage.clone(),
         ));
-        let app_service = Arc::new(AppService::new(
-            config,
-            tm.clone(),
-            None,
-            req_storage,
-            ws_storage,
-        ));
+        let app_service = Arc::new(AppService::new(config, tm.clone(), req_storage, ws_storage));
         let server = WebServer::new(app_service);
 
         // Seed tunnel-a so it has a live handle; disabling should stop it.
@@ -835,7 +1010,10 @@ mod tests {
         };
         assert!(!status.configured);
         assert!(status.tunnel_id.is_none());
-        assert!(!status.service_running);
+        assert_eq!(
+            status.connector,
+            crate::cloudflared::ConnectorState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -848,6 +1026,7 @@ mod tests {
             tunnel_id: Some("tid-123".to_string()),
             tunnel_name: "myapp".to_string(),
             tunnel_token: Some("token".to_string()),
+            manage_cloudflared: true,
         });
 
         let config = Arc::new(RwLock::new(cfg.clone()));
@@ -858,7 +1037,7 @@ mod tests {
             req_storage.clone(),
             ws_storage.clone(),
         ));
-        let app_service = Arc::new(AppService::new(config, tm, None, req_storage, ws_storage));
+        let app_service = Arc::new(AppService::new(config, tm, req_storage, ws_storage));
         let server = WebServer::new(app_service);
 
         let response = server.handle_get_cloudflare_status().await;
@@ -1203,5 +1382,423 @@ mod tests {
         // Should handle special characters in tunnel names
         assert!(path.contains(tunnel_name));
         assert!(path.ends_with(".sock"));
+    }
+}
+
+/// Tests against a real listening server: multiple clients, pushes, the
+/// control API and the security layer as wired into the router.
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::{RequestStorage, StoredRequest, WebSocketMessageStorage};
+    use crate::tunnel::TunnelManager;
+    use axum::body::Body;
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio::sync::RwLock;
+    use tokio_tungstenite::tungstenite;
+    use tower::ServiceExt as _;
+
+    const TOKEN: &str = "test-token";
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    struct TestServer {
+        port: u16,
+        app: Arc<AppService>,
+        context: ServerContext,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_app() -> Arc<AppService> {
+        let config = Config::default_config();
+        let requests = Arc::new(RequestStorage::new(100));
+        let messages = Arc::new(WebSocketMessageStorage::new(100));
+        let tunnels = Arc::new(TunnelManager::new(
+            &config,
+            requests.clone(),
+            messages.clone(),
+        ));
+        Arc::new(AppService::new(
+            Arc::new(RwLock::new(config)),
+            tunnels,
+            requests,
+            messages,
+        ))
+    }
+
+    fn make_context(port: u16) -> ServerContext {
+        ServerContext {
+            bound_port: port,
+            access_token: TOKEN.to_string(),
+            allowed_origins: vec!["http://localhost:5173".to_string()],
+            config_path: PathBuf::from("/tmp/tunneldesk-test.toml"),
+            config_hash: "0123456789abcdef".to_string(),
+            shutdown: CancellationToken::new(),
+            clients: ClientRegistry::new(),
+            idle_timeout: None,
+        }
+    }
+
+    async fn start_server() -> TestServer {
+        let (listener, port) = WebServer::bind(0).await.unwrap();
+        let app = make_app();
+        let context = make_context(port);
+        let server = WebServer::with_context(app.clone(), context.clone());
+        tokio::spawn(async move { server.serve(listener).await.unwrap() });
+        TestServer {
+            port,
+            app,
+            context,
+            _dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    async fn connect(port: u16) -> Ws {
+        let url = format!("ws://127.0.0.1:{port}/ws?token={TOKEN}");
+        tokio_tungstenite::connect_async(url).await.unwrap().0
+    }
+
+    async fn send(ws: &mut Ws, message: &WebSocketMessage) {
+        let text = serde_json::to_string(message).unwrap();
+        ws.send(tungstenite::Message::Text(text)).await.unwrap();
+    }
+
+    /// Returns the next response matching `pred`, skipping unrelated pushes.
+    async fn next_matching(
+        ws: &mut Ws,
+        pred: impl Fn(&WebSocketResponse) -> bool,
+    ) -> Option<WebSocketResponse> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, ws.next()).await.ok()??;
+            if let Ok(tungstenite::Message::Text(text)) = msg {
+                let response: WebSocketResponse = serde_json::from_str(&text).unwrap();
+                if pred(&response) {
+                    return Some(response);
+                }
+            }
+        }
+    }
+
+    fn exchange(id: &str, tunnel: &str) -> crate::storage::RequestExchange {
+        crate::storage::RequestExchange {
+            request: StoredRequest {
+                id: id.to_string(),
+                timestamp: chrono::Utc::now(),
+                tunnel_name: tunnel.to_string(),
+                method: "GET".to_string(),
+                url: "/".to_string(),
+                headers: Default::default(),
+                body: vec![],
+                raw_request: vec![],
+                replayed: false,
+            },
+            response: None,
+        }
+    }
+
+    async fn wait_for_clients(context: &ServerContext, expected: usize) {
+        let mut rx = context.clients.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|c| *c == expected))
+            .await
+            .unwrap_or_else(|_| panic!("expected {expected} attached clients"))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_per_connection() {
+        let server = start_server().await;
+        let mut a = connect(server.port).await;
+        let mut b = connect(server.port).await;
+        for (ws, tunnel) in [(&mut a, "tunnel-a"), (&mut b, "tunnel-b")] {
+            send(
+                ws,
+                &WebSocketMessage::Subscribe(QueryFilter {
+                    tunnel_name: Some(tunnel.to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            next_matching(ws, |r| matches!(r, WebSocketResponse::Requests(_)))
+                .await
+                .expect("subscribe acknowledgement");
+        }
+
+        server
+            .app
+            .request_storage
+            .store_exchange(exchange("req-a", "tunnel-a"))
+            .await;
+
+        let got = next_matching(&mut a, |r| matches!(r, WebSocketResponse::NewRequest(_))).await;
+        assert!(matches!(got, Some(WebSocketResponse::NewRequest(e)) if e.request.id == "req-a"));
+        let leaked = next_matching(&mut b, |r| matches!(r, WebSocketResponse::NewRequest(_))).await;
+        assert!(leaked.is_none(), "client B must not see tunnel-a requests");
+    }
+
+    #[tokio::test]
+    async fn tunnel_changes_reach_every_client() {
+        let server = start_server().await;
+        let mut a = connect(server.port).await;
+        let mut b = connect(server.port).await;
+        wait_for_clients(&server.context, 2).await;
+
+        // A change made outside the UI (e.g. by an MCP client).
+        let socket = server._dir.path().join("pushed.sock");
+        server
+            .app
+            .create_tunnel(crate::app_service::CreateTunnelRequest {
+                name: "pushed".into(),
+                domain: "pushed.example.com".into(),
+                socket_path: Some(socket.to_string_lossy().into_owned()),
+                target_port: 4321,
+            })
+            .await
+            .unwrap();
+
+        for ws in [&mut a, &mut b] {
+            let got = next_matching(ws, |r| matches!(r, WebSocketResponse::TunnelCreated(_))).await;
+            assert!(matches!(got, Some(WebSocketResponse::TunnelCreated(i)) if i.name == "pushed"));
+        }
+        server.app.tunnel_manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connector_changes_are_pushed() {
+        let server = start_server().await;
+        let mut ws = connect(server.port).await;
+        wait_for_clients(&server.context, 1).await;
+        server
+            .app
+            .connector_sender()
+            .send_replace(crate::cloudflared::ConnectorState::Connected);
+        let got = next_matching(&mut ws, |r| {
+            matches!(r, WebSocketResponse::CloudflareStatus(_))
+        })
+        .await;
+        assert!(got.is_some(), "expected a CloudflareStatus push");
+    }
+
+    #[tokio::test]
+    async fn clients_are_counted_and_released() {
+        let server = start_server().await;
+        let mut first = connect(server.port).await;
+        wait_for_clients(&server.context, 1).await;
+        let second = connect(server.port).await;
+
+        let got = next_matching(
+            &mut first,
+            |r| matches!(r, WebSocketResponse::CoreStatus(s) if s.attached_clients == 2),
+        )
+        .await;
+        assert!(got.is_some(), "expected CoreStatus push with 2 clients");
+
+        drop(second);
+        wait_for_clients(&server.context, 1).await;
+        send(&mut first, &WebSocketMessage::GetCoreStatus).await;
+        let got = next_matching(
+            &mut first,
+            |r| matches!(r, WebSocketResponse::CoreStatus(s) if s.attached_clients == 1),
+        )
+        .await;
+        let Some(WebSocketResponse::CoreStatus(status)) = got else {
+            panic!("expected CoreStatus");
+        };
+        assert_eq!(status.port, server.port);
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!(status.idle_timeout_secs, None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_command_cancels_core_and_notifies_clients() {
+        let server = start_server().await;
+        let mut requester = connect(server.port).await;
+        let mut other = connect(server.port).await;
+        wait_for_clients(&server.context, 2).await;
+
+        send(&mut requester, &WebSocketMessage::ShutdownCore).await;
+        for ws in [&mut requester, &mut other] {
+            let got = next_matching(ws, |r| matches!(r, WebSocketResponse::ShuttingDown)).await;
+            assert!(
+                got.is_some(),
+                "every client must be told about the shutdown"
+            );
+        }
+        assert!(server.context.shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn attach_endpoint_holds_a_client_slot() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let server = start_server().await;
+        let mut request = format!("ws://127.0.0.1:{}/api/attach", server.port)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        let (attach, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        wait_for_clients(&server.context, 1).await;
+        drop(attach);
+        wait_for_clients(&server.context, 0).await;
+    }
+
+    #[tokio::test]
+    async fn attach_endpoint_requires_token() {
+        let server = start_server().await;
+        let result =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/api/attach", server.port))
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_requires_token() {
+        let server = start_server().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://127.0.0.1:{}/api/shutdown", server.port);
+
+        let denied = client.post(&url).send().await.unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(!server.context.shutdown.is_cancelled());
+
+        let accepted = client.post(&url).bearer_auth(TOKEN).send().await.unwrap();
+        assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+        assert!(server.context.shutdown.is_cancelled());
+    }
+
+    // ── Security layer via tower oneshot ──────────────────────────────────────
+
+    fn router() -> Router {
+        WebServer::with_context(make_app(), make_context(4567)).router()
+    }
+
+    fn request(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    const HOST: (&str, &str) = ("host", "127.0.0.1:4567");
+
+    #[tokio::test]
+    async fn router_rejects_foreign_host() {
+        let resp = router()
+            .oneshot(request(
+                "GET",
+                "/api/health",
+                &[("host", "attacker.test:4567")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn router_serves_health_without_token() {
+        let resp = router()
+            .oneshot(request("GET", "/api/health", &[HOST]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.config_hash, "0123456789abcdef");
+        assert_eq!(health.pid, std::process::id());
+    }
+
+    #[tokio::test]
+    async fn router_rejects_foreign_origin_on_ws() {
+        let resp = router()
+            .oneshot(request(
+                "GET",
+                "/ws?token=test-token",
+                &[HOST, ("origin", "https://evil.example.com")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn router_exchanges_query_token_for_cookie() {
+        let resp = router()
+            .oneshot(request("GET", "/?token=test-token", &[HOST]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let cookie = resp.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.starts_with("tunneldesk_token_4567=test-token;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("location.replace(\"/\")"));
+    }
+
+    #[tokio::test]
+    async fn router_shows_login_page_without_token() {
+        let resp = router()
+            .oneshot(request("GET", "/", &[HOST]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("tunneldesk open"));
+    }
+
+    #[tokio::test]
+    async fn router_serves_ui_with_cookie() {
+        let resp = router()
+            .oneshot(request(
+                "GET",
+                "/",
+                &[HOST, ("cookie", "tunneldesk_token_4567=test-token")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_touches_activity_on_authenticated_requests() {
+        let context = make_context(4567);
+        let router = WebServer::with_context(make_app(), context.clone()).router();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = context.clients.idle_for();
+        router
+            .oneshot(request(
+                "GET",
+                "/",
+                &[HOST, ("authorization", "Bearer test-token")],
+            ))
+            .await
+            .unwrap();
+        assert!(context.clients.idle_for() < before);
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn router_protects_mcp_endpoint() {
+        let resp = router()
+            .oneshot(request(
+                "POST",
+                "/mcp",
+                &[HOST, ("content-type", "application/json")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

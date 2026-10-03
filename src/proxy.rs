@@ -441,6 +441,13 @@ impl Proxy {
         let socket_path = &self.config.socket_path;
 
         if Path::new(socket_path).exists() {
+            #[cfg(unix)]
+            if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+                anyhow::bail!(
+                    "socket {socket_path} is in use by another process \
+                     (is another TunnelDesk core using the same socket_path?)"
+                );
+            }
             std::fs::remove_file(socket_path)?;
         }
 

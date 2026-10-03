@@ -4,10 +4,14 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 
 ## Context
 
-- The `cloudflared` tunnel client is already running separately and forwarding traffic to a local Unix Domain Socket
 - Tunnels and all settings are configured in the `config.toml` file
-- There can be multiple tunnels configures, and multiple connections in parallel
+- There is one background **core** process per (canonical) config file. It owns the `cloudflared` child process, the proxies, the storage, and one authenticated HTTP endpoint on `127.0.0.1` (web UI, `/ws`, `/api/*`, `/mcp`)
+- The native window, browser tabs and MCP clients are thin frontends: they find the core via the info file in the runtime dir, or spawn it detached (`tunneldesk core --detached`)
+- The core runs `cloudflared tunnel run` as a supervised child process (unless `manage_cloudflared = false`), which forwards traffic to local Unix Domain Sockets
+- There can be multiple tunnels configured, and multiple connections in parallel
 - This proxy application forwards traffic from the Unix Domain Sockets to the configured local ports
+- A detached core exits after `[core] idle_timeout_secs` without attached clients; `tunneldesk stop` and the UI's quit action stop it explicitly
+- Every endpoint except `/api/health` requires `[gui] access_token` (bearer, cookie, or `?token=` on `/` and `/ws`); Host and Origin headers are checked
 - This proxy application stores all types of HTTP requests
 - Websocket messages are stored linked to the upgraded HTTP request
 - This proxy application stores the full requests and responses (including headers and bodies) in memory
@@ -25,14 +29,22 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 ## Architecture
 
 - `/src` contains the local proxy application in Rust
-- `/src/gui.rs` contains the native GUI window launcher (tao event loop + wry webview)
+  - `main.rs`: CLI (`serve`, `open`, `stop`, `status`, `mcp`, `mcp-config`, hidden `core`) and mode dispatch
+  - `core.rs`: `Core::start`/`shutdown`, Cloudflare setup, `ClientRegistry` and the idle watcher
+  - `instance.rs`: runtime dir, config hash, lock/info files, `ensure_core` (find or spawn a core)
+  - `security.rs`: Host/Origin/token policy used by the web server middleware
+  - `web_server.rs`: axum router, `/ws` protocol, `/api/health`, `/api/attach`, `/api/shutdown`, `/mcp`
+  - `cloudflared.rs`: supervised `cloudflared` child process and connector state
+  - `mcp.rs`: MCP tools, served over Streamable HTTP; `mcp_bridge.rs`: stdio-to-HTTP bridge for `mcp`
+- `/src/gui.rs` contains the native GUI window launcher (tao event loop + wry webview), a thin view onto the core
+- `/tests` contains integration tests that drive the real binary (`tests/common` has the helpers)
 - `/frontend` contains the local web UI in SvelteKit
 
 ## GUI Feature
 
 - Default build (`cargo build`) includes a native webview window that opens automatically
-- `cargo build --no-default-features` builds a headless server only (no wry/tao dependency)
-- `--no-gui` CLI flag runs the binary in headless mode even when compiled with the `gui` feature
+- The window attaches to (or starts) the core for its config file; closing it leaves the core running until it is idle
+- `cargo build --no-default-features` builds a headless server only (no wry/tao dependency); without a subcommand it runs `serve`
 - On Linux, requires system packages: `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`, `libjavascriptcoregtk-4.1-dev`, `libgtk-3-dev`
 
 ## Conventions
@@ -68,7 +80,8 @@ Local proxy for Cloudflare Tunnels, with request inspection.
 - API/WebSocket client lives under `frontend/src/lib/api/` (`websocket.svelte.ts`, `mappers.ts`)
 - Global styles are in `frontend/src/app.css` (not embedded in components)
 - In production (built SPA), WebSocket URL uses `window.location.host` — backend serves UI and WS on the same port
-- In dev (`npm run dev`), WebSocket URL uses `window.location.hostname` + `VITE_BACKEND_PORT` from `.env.development` (default 3013, matching `config.toml [gui] port`)
+- In dev (`npm run dev`), WebSocket URL uses `window.location.hostname` + `VITE_BACKEND_PORT` from `.env.development` (default 3013, matching `config.toml [gui] port`) and appends `?token=VITE_BACKEND_TOKEN` (set in the gitignored `.env.development.local`); the core must list `http://localhost:5173` in `[gui] allowed_origins`
+- Tunnel changes are broadcast to every client, including the one that made them, so store updates must be idempotent (e.g. `addTunnel` upserts by name)
 
 ## Frontend Testing
 

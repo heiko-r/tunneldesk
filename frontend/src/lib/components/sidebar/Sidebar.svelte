@@ -1,9 +1,10 @@
 <script lang="ts">
   import type { Tunnel } from "$lib/types";
-  import { queryRequests, syncTunnels } from "$lib/api/websocket.svelte";
-  import { cloudflareStatus } from "$lib/stores.svelte";
+  import { queryRequests, shutdownCore, syncTunnels } from "$lib/api/websocket.svelte";
+  import { cloudflareStatus, coreStatus } from "$lib/stores.svelte";
   import TunnelItem from "./TunnelItem.svelte";
   import CloudflareStatus from "./CloudflareStatus.svelte";
+  import CoreStatus from "./CoreStatus.svelte";
 
   let {
     tunnels,
@@ -75,6 +76,10 @@
       />
     {/each}
   </div>
+
+  {#if coreStatus.value}
+    <CoreStatus status={coreStatus.value} onquit={shutdownCore} />
+  {/if}
 </aside>
 
 <style>

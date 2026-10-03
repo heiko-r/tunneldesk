@@ -5,9 +5,14 @@ mod capture;
 mod cloudflare;
 mod cloudflared;
 mod config;
+mod core;
+mod instance;
 #[cfg(feature = "mcp")]
 mod mcp;
+#[cfg(feature = "mcp")]
+mod mcp_bridge;
 mod proxy;
+mod security;
 mod storage;
 mod sync;
 mod tunnel;
@@ -16,39 +21,63 @@ mod web_server;
 #[cfg(feature = "gui")]
 mod gui;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
-use clap::Parser;
-use tokio::sync::RwLock;
+use anyhow::Context as _;
+use clap::{Parser, Subcommand};
 use tracing::info;
-use tracing_subscriber::FmtSubscriber;
 
-use cloudflare::CloudflareClient;
-use cloudflared::CloudflaredService;
-use config::Config;
-use storage::{RequestStorage, WebSocketMessageStorage};
-use sync::{SyncReport, TunnelSync};
-use tunnel::TunnelManager;
-use web_server::WebServer;
+use crate::config::Config;
+use crate::core::{Core, CoreOptions};
+use crate::instance::{CoreInfo, CoreLock, InstancePaths, LockError};
 
 #[derive(Parser, Clone)]
 #[command(name = "tunneldesk")]
-#[command(about = "A local HTTP proxy with Unix domain sockets")]
+#[command(about = "Local proxy for Cloudflare Tunnels, with request inspection")]
 struct Args {
     /// Path to configuration file
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
-    /// Run without a native GUI window (headless server mode)
-    #[arg(long)]
-    no_gui: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    /// Run as an MCP server on stdio (requires the `mcp` Cargo feature).
-    /// Tracing output is redirected to stderr so it does not interfere with
-    /// the MCP protocol stream.
-    #[arg(long)]
-    mcp: bool,
+#[derive(Subcommand, Clone)]
+enum Command {
+    /// Run the core in the foreground until interrupted
+    Serve,
+    /// Open the web UI in the system browser, starting the core if needed
+    Open,
+    /// Stop the core for the config file (removes the Cloudflare routes)
+    Stop,
+    /// List running cores
+    Status,
+    /// Run as an MCP server on stdio, bridged to the core's HTTP endpoint
+    /// (requires the `mcp` Cargo feature)
+    Mcp,
+    /// Print MCP client configuration snippets for this config file
+    McpConfig,
+    /// Run the core process (started automatically by the other commands)
+    #[command(hide = true)]
+    Core {
+        /// Log to the runtime directory and exit when unused
+        #[arg(long)]
+        detached: bool,
+    },
+}
+
+/// What this invocation does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Window,
+    Serve,
+    Core { detached: bool },
+    McpBridge,
+    Open,
+    Stop,
+    Status,
+    McpConfig,
 }
 
 impl Args {
@@ -58,6 +87,22 @@ impl Args {
             return path.clone();
         }
         default_config_path()
+    }
+
+    fn mode(&self) -> Mode {
+        match &self.command {
+            Some(Command::Serve) => Mode::Serve,
+            Some(Command::Open) => Mode::Open,
+            Some(Command::Stop) => Mode::Stop,
+            Some(Command::Status) => Mode::Status,
+            Some(Command::Mcp) => Mode::McpBridge,
+            Some(Command::McpConfig) => Mode::McpConfig,
+            Some(Command::Core { detached }) => Mode::Core {
+                detached: *detached,
+            },
+            None if !cfg!(feature = "gui") => Mode::Serve,
+            None => Mode::Window,
+        }
     }
 }
 
@@ -70,13 +115,11 @@ impl Args {
 fn default_config_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(exe) = std::env::current_exe() {
-            if exe.to_string_lossy().contains(".app/Contents/MacOS/") {
-                if let Some(home) = std::env::var_os("HOME") {
-                    return PathBuf::from(home)
-                        .join("Library/Application Support/TunnelDesk/config.toml");
-                }
-            }
+        if let Ok(exe) = std::env::current_exe()
+            && exe.to_string_lossy().contains(".app/Contents/MacOS/")
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            return PathBuf::from(home).join("Library/Application Support/TunnelDesk/config.toml");
         }
     }
     #[cfg(target_os = "windows")]
@@ -99,260 +142,243 @@ fn default_config_path() -> PathBuf {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let mode = args.mode();
 
-    // Guard against --mcp on builds that lack the feature.
     #[cfg(not(feature = "mcp"))]
-    if args.mcp {
+    if matches!(mode, Mode::McpBridge | Mode::McpConfig) {
         anyhow::bail!(
             "This binary was not compiled with the 'mcp' feature. \
              Rebuild with `--features mcp`."
         );
     }
 
-    // When acting as an MCP server, stdout carries the JSON-RPC protocol
-    // stream, so tracing must be redirected to stderr instead.
-    #[cfg(feature = "mcp")]
-    if args.mcp {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(std::io::stderr)
-            .init();
-    } else {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)?;
-    }
-    // When the mcp feature is absent --mcp is already rejected above, so we
-    // always take the normal tracing path here.
-    #[cfg(not(feature = "mcp"))]
-    {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)?;
-    }
+    let canonical =
+        instance::canonical_config_path(&args.resolved_config()).context("invalid config path")?;
+    init_tracing(mode, &canonical)?;
 
-    // --mcp implies headless: the GUI must not own stdout.
     #[cfg(feature = "gui")]
-    if !args.no_gui && !args.mcp {
-        gui::launch(args); // diverges: tao event loop runs forever
+    if mode == Mode::Window {
+        let runtime = tokio::runtime::Runtime::new()?;
+        let (info, token) = runtime.block_on(attach(&canonical))?;
+        drop(runtime);
+        gui::launch(&info, &token); // diverges: tao event loop runs forever
     }
 
-    tokio::runtime::Runtime::new()?.block_on(run_headless(args))
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run(mode, &canonical));
+    if let Err(e) = &result
+        && let Some(LockError::AlreadyLocked) = e.downcast_ref::<LockError>()
+    {
+        eprintln!("{e:#}");
+        std::process::exit(instance::EXIT_ALREADY_RUNNING);
+    }
+    result
 }
 
-async fn run_headless(args: Args) -> anyhow::Result<()> {
-    let (tunnel_manager, web_server_handle, tunnel_sync, config) = init_app(&args).await?;
-
-    tunnel_manager.wait_for_shutdown_signal().await;
-
-    // Cloudflare cleanup: remove all configured tunnels on shutdown
-    if let Some(sync) = tunnel_sync {
-        let cfg = config.read().await;
-        if let Err(e) = sync.remove_all_configured_tunnels(&cfg).await {
-            tracing::warn!("Failed to remove tunnels from Cloudflare during shutdown: {e}");
-        } else {
-            tracing::info!("Removed all configured tunnels from Cloudflare");
+/// Logs go to stderr for the MCP bridge (stdout carries the protocol), to a
+/// file for detached cores, and to stdout otherwise.
+fn init_tracing(mode: Mode, canonical: &Path) -> anyhow::Result<()> {
+    let builder = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO);
+    match mode {
+        Mode::McpBridge => builder.with_writer(std::io::stderr).init(),
+        Mode::Core { detached: true } => {
+            let paths = InstancePaths::for_hash(&instance::config_hash(canonical));
+            if let Some(dir) = paths.log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let file = std::fs::File::create(&paths.log)
+                .with_context(|| format!("failed to create {}", paths.log.display()))?;
+            builder
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
         }
-        drop(cfg);
+        _ => builder.init(),
     }
-
-    tunnel_manager.shutdown().await;
-    web_server_handle.abort();
-
     Ok(())
 }
 
-/// Initialises all app components and returns handles needed for lifecycle management.
-/// Returns `(tunnel_manager, web_server_handle, tunnel_sync, config)`.
-pub(crate) async fn init_app(
-    args: &Args,
-) -> anyhow::Result<(
-    Arc<TunnelManager>,
-    tokio::task::JoinHandle<()>,
-    Option<Arc<TunnelSync>>,
-    Arc<RwLock<Config>>,
-)> {
-    // Load configuration
-    let config_path = args.resolved_config();
-    let mut config = if config_path.exists() {
-        Config::from_file(&config_path)?
-    } else {
-        info!("Config file not found, using default configuration");
-        Config::default_config()
-    };
-
-    // Cloudflare setup (only when [cloudflare] section is present)
-    let tunnel_sync: Option<Arc<TunnelSync>> = setup_cloudflare(&mut config, &config_path).await;
-
-    // Wrap config in shared Arc<RwLock> for live mutation by CRUD handlers.
-    let shared_config = Arc::new(RwLock::new(config));
-
-    // Create storage instances
-    let cfg = shared_config.read().await;
-    let request_storage = Arc::new(RequestStorage::new(cfg.capture.max_stored_requests));
-    let websocket_storage = Arc::new(WebSocketMessageStorage::new(
-        cfg.capture.max_stored_requests,
-    ));
-    drop(cfg);
-
-    // Create tunnel manager
-    let tunnel_manager = {
-        let cfg = shared_config.read().await;
-        Arc::new(TunnelManager::new(
-            &cfg,
-            request_storage.clone(),
-            websocket_storage.clone(),
-        ))
-    };
-
-    // Create AppService instance.
-    let app_service = Arc::new(crate::app_service::AppService::new(
-        shared_config.clone(),
-        tunnel_manager.clone(),
-        tunnel_sync.clone(),
-        request_storage.clone(),
-        websocket_storage.clone(),
-    ));
-
-    // Create and start web server.
-    let web_server = WebServer::new(app_service.clone());
-
-    // Start MCP stdio server when requested (feature-gated).
-    #[cfg(feature = "mcp")]
-    if args.mcp {
-        let mcp_server = mcp::TunnelDeskMcp::new(app_service.clone());
-        tokio::spawn(async move {
-            use rmcp::ServiceExt as _;
-            match mcp_server.serve(rmcp::transport::io::stdio()).await {
-                Ok(service) => {
-                    if let Err(e) = service.waiting().await {
-                        tracing::error!("MCP server error: {e}");
-                    }
-                }
-                Err(e) => tracing::error!("Failed to start MCP server: {e}"),
+async fn run(mode: Mode, canonical: &Path) -> anyhow::Result<()> {
+    match mode {
+        Mode::Window => unreachable!("handled before the runtime starts"),
+        Mode::Serve => run_core(canonical, false).await,
+        Mode::Core { detached } => run_core(canonical, detached).await,
+        #[cfg(feature = "mcp")]
+        Mode::McpBridge => mcp_bridge::run(canonical).await,
+        #[cfg(feature = "mcp")]
+        Mode::McpConfig => print_mcp_config(canonical),
+        #[cfg(not(feature = "mcp"))]
+        Mode::McpBridge | Mode::McpConfig => unreachable!("rejected in main"),
+        Mode::Open => {
+            let (info, token) = attach(canonical).await?;
+            let url = format!("{}/?token={token}", info.base_url());
+            open::that(&url).with_context(|| format!("failed to open {}", info.base_url()))?;
+            println!("Opened {}", info.base_url());
+            Ok(())
+        }
+        Mode::Stop => {
+            let Some(info) = instance::find_core(canonical).await else {
+                println!("No TunnelDesk core is running for {}", canonical.display());
+                return Ok(());
+            };
+            instance::stop_core(&info, &read_access_token(canonical)?).await?;
+            println!("Stopped TunnelDesk core (pid {})", info.pid);
+            Ok(())
+        }
+        Mode::Status => {
+            let cores = instance::live_cores().await;
+            if cores.is_empty() {
+                println!("No TunnelDesk cores are running");
             }
-        });
+            for core in cores {
+                println!(
+                    "pid {:<8} {:<24} {}",
+                    core.pid,
+                    core.base_url(),
+                    core.config_path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Finds or starts the core and returns it together with its access token.
+async fn attach(canonical: &Path) -> anyhow::Result<(CoreInfo, String)> {
+    let info = instance::ensure_core(canonical).await?;
+    let token = read_access_token(&info.config_path)?;
+    Ok((info, token))
+}
+
+fn read_access_token(config_path: &Path) -> anyhow::Result<String> {
+    Config::from_file(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?
+        .gui
+        .access_token
+        .context("the config has no gui.access_token yet; start the core once to generate it")
+}
+
+/// Runs a core for `canonical` until a signal or a shutdown request.
+async fn run_core(canonical: &Path, detached: bool) -> anyhow::Result<()> {
+    let paths = InstancePaths::for_hash(&instance::config_hash(canonical));
+    let lock = match CoreLock::acquire(&paths) {
+        Ok(lock) => lock,
+        Err(LockError::AlreadyLocked) => {
+            let running = instance::read_info(&paths)
+                .map(|i| format!(" (pid {}, {})", i.pid, i.base_url()))
+                .unwrap_or_default();
+            return Err(
+                anyhow::Error::new(LockError::AlreadyLocked).context(format!(
+                    "a TunnelDesk core for {} is already running{running}",
+                    canonical.display()
+                )),
+            );
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to lock the core instance")),
+    };
+
+    let core = Core::start(
+        canonical,
+        CoreOptions {
+            idle_shutdown: detached,
+        },
+    )
+    .await?;
+    instance::write_info(
+        &paths,
+        &CoreInfo {
+            pid: std::process::id(),
+            port: core.port(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            config_path: canonical.to_path_buf(),
+            config_hash: instance::config_hash(canonical),
+        },
+    )
+    .context("failed to publish the core info file")?;
+    info!("Core for {} is ready", core.config_path().display());
+
+    let shutdown = core.shutdown_token();
+    tokio::select! {
+        _ = core::shutdown_signal() => {}
+        _ = shutdown.cancelled() => {}
     }
 
-    let web_server_handle = tokio::spawn(async move {
-        if let Err(e) = web_server.start().await {
-            tracing::error!("Web server error: {}", e);
-        }
+    instance::remove_info(&paths);
+    core.shutdown().await;
+    drop(lock);
+    Ok(())
+}
+
+#[cfg(feature = "mcp")]
+fn print_mcp_config(canonical: &Path) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let config = Config::load_or_create(canonical)?;
+    let stdio = serde_json::json!({
+        "mcpServers": { "tunneldesk": {
+            "command": exe,
+            "args": ["mcp", "--config", canonical],
+        }}
     });
+    println!("# stdio (starts the core on demand):");
+    println!("{}", serde_json::to_string_pretty(&stdio)?);
 
-    // Start all tunnels
-    {
-        let cfg = shared_config.read().await;
-        tunnel_manager.start_tunnels(&cfg).await;
+    println!();
+    println!("# Streamable HTTP (the core must already be running):");
+    if config.gui.port == 0 {
+        println!("# [gui] port = 0 picks a new port on every start; use the stdio variant.");
+        return Ok(());
     }
-
-    Ok((
-        tunnel_manager,
-        web_server_handle,
-        tunnel_sync,
-        shared_config,
-    ))
+    let token = config
+        .gui
+        .access_token
+        .unwrap_or_else(|| "<start the core once to generate gui.access_token>".into());
+    let http = serde_json::json!({
+        "mcpServers": { "tunneldesk": {
+            "url": format!("http://127.0.0.1:{}/mcp", config.gui.port),
+            "headers": { "Authorization": format!("Bearer {token}") },
+        }}
+    });
+    println!("{}", serde_json::to_string_pretty(&http)?);
+    Ok(())
 }
 
-/// Performs Cloudflare setup if `[cloudflare]` is configured.
-///
-/// Creates the tunnel on first run, installs cloudflared if needed, and
-/// performs an initial sync. Returns `None` when Cloudflare is not configured.
-async fn setup_cloudflare(
-    config: &mut Config,
-    config_path: &std::path::Path,
-) -> Option<Arc<TunnelSync>> {
-    let cf_cfg = config.cloudflare.as_ref()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let client = match CloudflareClient::new(&cf_cfg.api_token, &cf_cfg.account_id, &cf_cfg.zone_id)
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to create Cloudflare client: {e}");
-            return None;
-        }
-    };
+    fn parse(args: &[&str]) -> Args {
+        Args::try_parse_from(std::iter::once("tunneldesk").chain(args.iter().copied())).unwrap()
+    }
 
-    // Create tunnel if not already configured.
-    if cf_cfg.tunnel_id.is_none() {
-        info!("No tunnel_id configured; creating a new Cloudflare tunnel...");
-        let tunnel_name = cf_cfg.tunnel_name.clone();
-
-        let secret = generate_tunnel_secret();
-        let tunnel_id = match client.create_tunnel(&tunnel_name, &secret).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!("Failed to create Cloudflare tunnel: {e}");
-                return None;
-            }
+    #[test]
+    fn default_mode_depends_on_gui_feature() {
+        let expected = if cfg!(feature = "gui") {
+            Mode::Window
+        } else {
+            Mode::Serve
         };
-        info!("Created Cloudflare tunnel: {tunnel_id}");
-
-        let token = match client.get_tunnel_token(&tunnel_id).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Failed to get tunnel token: {e}");
-                return None;
-            }
-        };
-
-        if let Err(e) = TunnelSync::save_tunnel_credentials(config, config_path, tunnel_id, token) {
-            tracing::error!("Failed to save tunnel credentials to config: {e}");
-            return None;
-        }
-        info!("Saved tunnel credentials to {}", config_path.display());
+        assert_eq!(parse(&[]).mode(), expected);
     }
 
-    let cf_cfg = config.cloudflare.as_ref().unwrap();
-    let tunnel_id = cf_cfg.tunnel_id.as_ref().unwrap().clone();
-    let tunnel_token = cf_cfg.tunnel_token.as_deref().unwrap_or("").to_string();
-
-    // Install and start cloudflared service if needed.
-    if !CloudflaredService::is_installed().await {
-        tracing::warn!(
-            "cloudflared binary not found on PATH. \
-             Install it and run `cloudflared service install {tunnel_token}` manually."
-        );
-    } else if !CloudflaredService::is_running().await {
-        info!("cloudflared service not running; installing...");
-        if let Err(e) = CloudflaredService::install_and_start(&tunnel_token).await {
-            tracing::warn!("Failed to install cloudflared service: {e}");
-        }
-    }
-
-    let sync = Arc::new(TunnelSync::new(client, &tunnel_id));
-
-    // Initial sync — report unknown hosts as warnings but don't auto-remove.
-    let report: SyncReport = sync.sync_to_cloudflare(config).await;
-    if !report.added.is_empty() {
-        info!(
-            "Sync: added {} host(s): {:?}",
-            report.added.len(),
-            report.added
+    #[test]
+    fn subcommands_map_to_modes() {
+        assert_eq!(parse(&["serve"]).mode(), Mode::Serve);
+        assert_eq!(parse(&["open"]).mode(), Mode::Open);
+        assert_eq!(parse(&["stop"]).mode(), Mode::Stop);
+        assert_eq!(parse(&["status"]).mode(), Mode::Status);
+        assert_eq!(parse(&["mcp"]).mode(), Mode::McpBridge);
+        assert_eq!(parse(&["mcp-config"]).mode(), Mode::McpConfig);
+        assert_eq!(
+            parse(&["core", "--detached"]).mode(),
+            Mode::Core { detached: true }
         );
     }
-    if !report.unknown_hosts.is_empty() {
-        tracing::warn!(
-            "Cloudflare has {} unknown host(s) not in config.toml: {:?}. \
-             Use the web UI to confirm removal.",
-            report.unknown_hosts.len(),
-            report.unknown_hosts
-        );
-    }
-    for err in &report.errors {
-        tracing::warn!("Sync error: {err}");
-    }
 
-    Some(sync)
-}
-
-/// Generates a base64-encoded random 32-byte tunnel secret.
-fn generate_tunnel_secret() -> String {
-    use base64::Engine as _;
-    use rand::RngCore;
-    let mut secret = [0u8; 32];
-    rand::rng().fill_bytes(&mut secret);
-    base64::engine::general_purpose::STANDARD.encode(secret)
+    #[test]
+    fn config_flag_is_global() {
+        let args = parse(&["core", "--config", "/tmp/x.toml"]);
+        assert_eq!(args.resolved_config(), PathBuf::from("/tmp/x.toml"));
+        let args = parse(&["--config", "/tmp/y.toml", "stop"]);
+        assert_eq!(args.resolved_config(), PathBuf::from("/tmp/y.toml"));
+    }
 }

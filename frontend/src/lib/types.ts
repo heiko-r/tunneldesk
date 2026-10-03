@@ -43,11 +43,26 @@ export type TunneledRequest = {
 
 export type RequestTab = "headers" | "request" | "response" | "ws";
 
+/** State of the `cloudflared` connector as reported by the core. */
+export type ConnectorState = "Stopped" | "Starting" | "Connected" | "External" | "NotInstalled";
+
 export type CloudflareStatus = {
   configured: boolean;
   tunnelId?: string;
   tunnelName?: string;
-  serviceRunning: boolean;
+  connector: ConnectorState;
+};
+
+/** Status of the shared core process this UI is attached to. */
+export type CoreStatus = {
+  attachedClients: number;
+  pid: number;
+  port: number;
+  configPath: string;
+  /** Seconds of inactivity before the core exits; `null` when it runs until stopped. */
+  idleTimeoutSecs: number | null;
+  /** Set once the core announced that it is shutting down. */
+  shuttingDown: boolean;
 };
 
 export type SyncReport = {

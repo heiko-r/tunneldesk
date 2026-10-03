@@ -618,7 +618,8 @@ enabled = true
                 max_stored_requests: 100,
                 max_request_body_size: 1048576,
             },
-            gui: crate::config::GuiConfig { port: 8081 },
+            gui: crate::config::GuiConfig::with_port(8081),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         };
@@ -649,7 +650,8 @@ enabled = true
                 max_stored_requests: 100,
                 max_request_body_size: 1048576,
             },
-            gui: crate::config::GuiConfig { port: 8081 },
+            gui: crate::config::GuiConfig::with_port(8081),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         };

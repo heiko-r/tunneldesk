@@ -4,6 +4,7 @@ import {
   addTunnel,
   addWsMessage,
   cloudflareStatus,
+  coreStatus,
   lastReplayedId,
   lastSyncReport,
   removeTunnel,
@@ -14,6 +15,7 @@ import {
 } from "$lib/stores.svelte";
 import { mapToTunnel, mapToTunneledRequest, decodeWsPayload, parseWsDirection } from "./mappers";
 import type { RawTunnel } from "./mappers";
+import type { ConnectorState } from "$lib/types";
 
 // ── Protocol types ────────────────────────────────────────────────────────────
 
@@ -95,7 +97,18 @@ type CloudflareStatusResponse = {
     configured: boolean;
     tunnel_id?: string;
     tunnel_name?: string;
-    service_running: boolean;
+    connector: ConnectorState;
+  };
+};
+
+type CoreStatusResponse = {
+  type: "CoreStatus";
+  data: {
+    attached_clients: number;
+    pid: number;
+    port: number;
+    config_path: string;
+    idle_timeout_secs?: number | null;
   };
 };
 
@@ -117,18 +130,27 @@ export const connectionState = $state({ connected: false });
 
 // ── Connection ────────────────────────────────────────────────────────────────
 
+/**
+ * In production the UI is served by the core itself and authenticates with the
+ * session cookie. The vite dev server runs on another origin, so the token is
+ * passed explicitly.
+ */
+function websocketUrl(): string {
+  if (!import.meta.env.DEV) return `ws://${window.location.host}/ws`;
+  const host = `${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT || 3013}`;
+  const token = import.meta.env.VITE_BACKEND_TOKEN;
+  return token ? `ws://${host}/ws?token=${encodeURIComponent(token)}` : `ws://${host}/ws`;
+}
+
 function connect() {
-  const host = import.meta.env.DEV
-    ? `${window.location.hostname}:${import.meta.env.VITE_BACKEND_PORT || 3013}`
-    : window.location.host;
-  const wsUrl = `ws://${host}/ws`;
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(websocketUrl());
 
   ws.onopen = () => {
     connectionState.connected = true;
     console.log("WebSocket connected");
     queryTunnels();
     getCloudflareStatus();
+    getCoreStatus();
   };
 
   ws.onmessage = (event) => {
@@ -164,6 +186,12 @@ function connect() {
           break;
         case "CloudflareStatus":
           handleCloudflareStatusMessage(message as CloudflareStatusResponse);
+          break;
+        case "CoreStatus":
+          handleCoreStatusMessage(message as CoreStatusResponse);
+          break;
+        case "ShuttingDown":
+          handleShuttingDownMessage();
           break;
         case "ReplayResponse":
           handleReplayResponseMessage(message as ReplayResponseMessage);
@@ -279,8 +307,26 @@ function handleCloudflareStatusMessage(message: CloudflareStatusResponse) {
     configured: message.data.configured,
     tunnelId: message.data.tunnel_id,
     tunnelName: message.data.tunnel_name,
-    serviceRunning: message.data.service_running,
+    connector: message.data.connector,
   };
+}
+
+function handleCoreStatusMessage(message: CoreStatusResponse) {
+  const d = message.data;
+  coreStatus.value = {
+    attachedClients: d.attached_clients,
+    pid: d.pid,
+    port: d.port,
+    configPath: d.config_path,
+    idleTimeoutSecs: d.idle_timeout_secs ?? null,
+    shuttingDown: false,
+  };
+}
+
+function handleShuttingDownMessage() {
+  if (coreStatus.value) coreStatus.value.shuttingDown = true;
+  // The native window is only a view onto the core; close it with the core.
+  window.ipc?.postMessage("quit");
 }
 
 function handleReplayResponseMessage(message: ReplayResponseMessage) {
@@ -383,6 +429,16 @@ export function confirmRemoveHosts(hosts: string[]) {
 /** Requests the current Cloudflare integration status. */
 export function getCloudflareStatus() {
   send({ type: "GetCloudflareStatus" });
+}
+
+/** Requests the status of the shared core (attached clients, pid, port). */
+export function getCoreStatus() {
+  send({ type: "GetCoreStatus" });
+}
+
+/** Stops the shared core: all tunnels and the cloudflared connector shut down. */
+export function shutdownCore() {
+  send({ type: "ShutdownCore" });
 }
 
 /** Replays an HTTP request with the given parameters. */

@@ -1,5 +1,4 @@
 use std::io::Cursor;
-use std::sync::Arc;
 
 use image::ImageReader;
 use rust_embed::Embed;
@@ -11,74 +10,27 @@ use tao::{
 };
 use wry::WebViewBuilder;
 
-use crate::{Args, config::Config};
+use crate::instance::CoreInfo;
 
 #[derive(Embed)]
 #[folder = "assets"]
 struct AppAssets;
 
-/// Launches the native GUI window. Runs the tao event loop on the calling
-/// (main) thread; the Tokio runtime and all app logic run on a background thread.
+/// Events sent to the tao event loop from outside the window.
+#[derive(Debug)]
+enum UserEvent {
+    /// The UI stopped the core, so the window has nothing left to show.
+    Quit,
+}
+
+/// Opens the native window for an already running core. The window is only a
+/// frontend: closing it detaches from the core, which keeps serving other
+/// clients (and exits on its own once unused).
 ///
 /// This function never returns.
-pub fn launch(args: Args) -> ! {
-    // Read the port from config before building the WebView so that the loading
-    // page can start polling the server immediately, without any IPC round-trip.
-    // This avoids a race where `load_url` is called before the WebView has
-    // finished initialising its initial page, which caused an occasional blank
-    // white screen on first launch.
-    let config_path = args.resolved_config();
-    let port = if config_path.exists() {
-        Config::from_file(&config_path)
-            .map(|c| c.gui.port)
-            .unwrap_or_else(|_| Config::default_config().gui.port)
-    } else {
-        Config::default_config().gui.port
-    };
-
-    let event_loop = EventLoopBuilder::<()>::with_user_event().build();
-
-    // Channel to signal the background thread to shut down when the window closes.
-    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    // Channel for background thread to signal when cleanup is complete.
-    let (cleanup_done_tx, cleanup_done_rx) = std::sync::mpsc::sync_channel::<()>(1);
-
-    // Background thread: runs the Tokio runtime and all async app logic.
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
-        rt.block_on(async move {
-            match crate::init_app(&args).await {
-                Ok((tunnel_manager, web_server_handle, tunnel_sync, config)) => {
-                    // Wait for the window-close signal from the main thread.
-                    tokio::task::spawn_blocking(move || shutdown_rx.recv().ok())
-                        .await
-                        .ok();
-
-                    // Cloudflare cleanup: remove all configured tunnels on shutdown
-                    if let Some(sync) = tunnel_sync {
-                        let cfg = config.read().await;
-                        if let Err(e) = sync.remove_all_configured_tunnels(&cfg).await {
-                            tracing::warn!(
-                                "Failed to remove tunnels from Cloudflare during shutdown: {e}"
-                            );
-                        } else {
-                            tracing::info!("Removed all configured tunnels from Cloudflare");
-                        }
-                        drop(cfg);
-                    }
-
-                    tunnel_manager.shutdown().await;
-                    web_server_handle.abort();
-
-                    // Signal main thread that cleanup is complete.
-                    let _ = cleanup_done_tx.send(());
-                }
-                Err(e) => {
-                    tracing::error!("App initialisation failed: {e}");
-                }
-            }
-        });
-    });
+pub fn launch(core: &CoreInfo, token: &str) -> ! {
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
 
     let icon_file = AppAssets::get("icon.png").expect("failed to load app icon");
     let mut icon_reader = ImageReader::new(Cursor::new(icon_file.data));
@@ -96,50 +48,39 @@ pub fn launch(args: Args) -> ! {
         .build(&event_loop)
         .expect("failed to create window");
 
-    let loading_html = make_loading_html(port);
-    let webview = build_webview(&window, &loading_html).expect("failed to create webview");
-
-    // Keep shutdown_tx and cleanup_done_rx alive in the closure so they are
-    // dropped (closing the channel) only when the event loop exits.
-    let shutdown_tx = Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
-    let cleanup_done_rx = Arc::new(std::sync::Mutex::new(Some(cleanup_done_rx)));
+    let loading_html = make_loading_html(core.port, token);
+    let webview = build_webview(&window, &loading_html, move |message| {
+        if message == "quit" {
+            let _ = proxy.send_event(UserEvent::Quit);
+        }
+    })
+    .expect("failed to create webview");
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         // Keep the webview alive for the duration of the event loop.
         let _ = &webview;
 
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            // Signal the background thread to start shutdown.
-            if let Ok(mut guard) = shutdown_tx.lock()
-                && let Some(tx) = guard.take()
-            {
-                tx.send(()).ok();
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
             }
-
-            // Wait for background thread to complete cleanup before exiting.
-            if let Ok(mut guard) = cleanup_done_rx.lock()
-                && let Some(rx) = guard.take()
-            {
-                // Use a timeout to avoid hanging if cleanup fails
-                let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
-            }
-
-            *control_flow = ControlFlow::Exit;
+            | Event::UserEvent(UserEvent::Quit) => *control_flow = ControlFlow::Exit,
+            _ => {}
         }
     })
 }
 
 /// Builds the splash-screen HTML with an embedded JS fetch-poll that
-/// navigates to the app once the local server responds.  Using JS polling
+/// navigates to the app once the core responds.  Using JS polling
 /// instead of a Rust `load_url` call avoids a race where `load_url` is
 /// issued before the WebView has finished loading its initial document,
 /// which produced an occasional blank white screen on first launch.
-fn make_loading_html(port: u16) -> String {
+///
+/// The app URL carries the access token once; the core exchanges it for a
+/// cookie and the page then navigates to the clean URL.
+fn make_loading_html(port: u16, token: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html>
@@ -163,10 +104,10 @@ fn make_loading_html(port: u16) -> String {
 <body>
 <script>
 (function () {{
-  var url = 'http://127.0.0.1:{port}';
+  var base = 'http://127.0.0.1:{port}';
   var id = setInterval(function () {{
-    fetch(url, {{ method: 'HEAD', cache: 'no-store', mode: 'no-cors' }})
-      .then(function () {{ clearInterval(id); window.location.replace(url); }})
+    fetch(base + '/api/health', {{ cache: 'no-store', mode: 'no-cors' }})
+      .then(function () {{ clearInterval(id); window.location.replace(base + '/?token={token}'); }})
       .catch(function () {{}});
   }}, 150);
 }})();
@@ -184,22 +125,37 @@ fn make_loading_html(port: u16) -> String {
 </svg>
 </body>
 </html>"#,
-        port = port
+        port = port,
+        token = token
     )
 }
 
 /// Constructs the [`WebView`] for the given window, handling the platform
 /// difference between Unix (GTK container) and other platforms.
 #[cfg(not(target_os = "linux"))]
-fn build_webview(window: &tao::window::Window, html: &str) -> wry::Result<wry::WebView> {
-    WebViewBuilder::new().with_html(html).build(window)
+fn build_webview(
+    window: &tao::window::Window,
+    html: &str,
+    on_message: impl Fn(&str) + 'static,
+) -> wry::Result<wry::WebView> {
+    WebViewBuilder::new()
+        .with_html(html)
+        .with_ipc_handler(move |request| on_message(request.body()))
+        .build(window)
 }
 
 #[cfg(target_os = "linux")]
-fn build_webview(window: &tao::window::Window, html: &str) -> wry::Result<wry::WebView> {
+fn build_webview(
+    window: &tao::window::Window,
+    html: &str,
+    on_message: impl Fn(&str) + 'static,
+) -> wry::Result<wry::WebView> {
     use tao::platform::unix::WindowExtUnix;
     use wry::WebViewBuilderExtUnix;
 
     let vbox = window.default_vbox().expect("no GTK vbox on window");
-    WebViewBuilder::new().with_html(html).build_gtk(vbox)
+    WebViewBuilder::new()
+        .with_html(html)
+        .with_ipc_handler(move |request| on_message(request.body()))
+        .build_gtk(vbox)
 }

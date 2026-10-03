@@ -2,9 +2,10 @@
 //!
 //! Exposes tools for managing Cloudflare tunnels, querying captured HTTP
 //! requests and WebSocket messages, and replaying them — accessible to any
-//! AI tool that speaks the MCP protocol over stdio.
+//! AI tool that speaks MCP. The core serves it over Streamable HTTP at `/mcp`;
+//! `tunneldesk mcp` bridges stdio-only clients to that endpoint.
 //!
-//! Enabled by the `mcp` Cargo feature; activated at runtime with `--mcp`.
+//! Enabled by the `mcp` Cargo feature.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,8 +16,12 @@ use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
     schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::app_service::{
     AppService, CreateTunnelRequest, DeleteTunnelRequest, ReplayRequestPayload, UpdateTunnelRequest,
@@ -504,6 +509,19 @@ impl ServerHandler for TunnelDeskMcp {
     }
 }
 
+/// Builds the Streamable HTTP MCP service mounted at `/mcp` in the core.
+/// Sessions are terminated when `shutdown` is cancelled.
+pub fn http_service(
+    app_service: Arc<AppService>,
+    shutdown: CancellationToken,
+) -> StreamableHttpService<TunnelDeskMcp, LocalSessionManager> {
+    StreamableHttpService::new(
+        move || Ok(TunnelDeskMcp::new(app_service.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().with_cancellation_token(shutdown),
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -526,7 +544,8 @@ mod tests {
                 max_stored_requests: 100,
                 max_request_body_size: 1024 * 1024,
             },
-            gui: GuiConfig { port: 9999 },
+            gui: GuiConfig::with_port(9999),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         }
@@ -549,7 +568,6 @@ mod tests {
         let app_service = Arc::new(AppService::new(
             config,
             tunnel_manager,
-            None,
             request_storage,
             websocket_storage,
         ));

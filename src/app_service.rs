@@ -3,9 +3,9 @@ use rand::{Rng, distr::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{OnceCell, RwLock, broadcast, watch};
 
-use crate::cloudflared::CloudflaredService;
+use crate::cloudflared::ConnectorState;
 use crate::config::{Config, TunnelConfig};
 use crate::storage::{RequestStorage, WebSocketMessageStorage};
 use crate::sync::TunnelSync;
@@ -151,33 +151,76 @@ pub struct CloudflareStatusResponse {
     pub configured: bool,
     pub tunnel_id: Option<String>,
     pub tunnel_name: Option<String>,
-    pub service_running: bool,
+    pub connector: ConnectorState,
+}
+
+/// Change notifications broadcast to every connected client, regardless of
+/// which frontend (GUI, browser, MCP) triggered the change.
+#[derive(Debug, Clone)]
+pub enum TunnelEvent {
+    Created(TunnelInfo),
+    Updated(TunnelInfo),
+    Deleted(TunnelDeletedResponse),
 }
 
 #[derive(Clone)]
 pub struct AppService {
     pub config: Arc<RwLock<Config>>,
     pub tunnel_manager: Arc<TunnelManager>,
-    pub tunnel_sync: Option<Arc<TunnelSync>>,
+    /// Set once the background Cloudflare setup has finished.
+    tunnel_sync: Arc<OnceCell<Arc<TunnelSync>>>,
     pub request_storage: Arc<RequestStorage>,
     pub websocket_storage: Arc<WebSocketMessageStorage>,
+    connector: watch::Sender<ConnectorState>,
+    events: broadcast::Sender<TunnelEvent>,
 }
 
 impl AppService {
     pub fn new(
         config: Arc<RwLock<Config>>,
         tunnel_manager: Arc<TunnelManager>,
-        tunnel_sync: Option<Arc<TunnelSync>>,
         request_storage: Arc<RequestStorage>,
         websocket_storage: Arc<WebSocketMessageStorage>,
     ) -> Self {
+        let (connector, _) = watch::channel(ConnectorState::Stopped);
+        let (events, _) = broadcast::channel(64);
         Self {
             config,
             tunnel_manager,
-            tunnel_sync,
+            tunnel_sync: Arc::new(OnceCell::new()),
             request_storage,
             websocket_storage,
+            connector,
+            events,
         }
+    }
+
+    /// Returns the Cloudflare sync handle once Cloudflare setup has completed.
+    pub fn tunnel_sync(&self) -> Option<Arc<TunnelSync>> {
+        self.tunnel_sync.get().cloned()
+    }
+
+    /// Installs the Cloudflare sync handle. Returns `false` if one was already set.
+    pub fn set_tunnel_sync(&self, sync: Arc<TunnelSync>) -> bool {
+        self.tunnel_sync.set(sync).is_ok()
+    }
+
+    /// Sender through which the `cloudflared` supervisor publishes its state.
+    pub fn connector_sender(&self) -> watch::Sender<ConnectorState> {
+        self.connector.clone()
+    }
+
+    pub fn subscribe_connector(&self) -> watch::Receiver<ConnectorState> {
+        self.connector.subscribe()
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<TunnelEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, event: TunnelEvent) {
+        // No receivers is fine: nobody is connected.
+        let _ = self.events.send(event);
     }
 
     pub async fn create_tunnel(&self, req: CreateTunnelRequest) -> Result<TunnelInfo, String> {
@@ -219,7 +262,7 @@ impl AppService {
 
         // Cloudflare: add ingress rule + DNS.
         if new_tunnel.enabled
-            && let Some(sync) = &self.tunnel_sync
+            && let Some(sync) = self.tunnel_sync()
             && let Err(e) = sync.add_single_tunnel(&new_tunnel).await
         {
             tracing::warn!("Cloudflare add_single_tunnel failed: {e}");
@@ -228,6 +271,7 @@ impl AppService {
         // Start local proxy.
         self.tunnel_manager.start_tunnel(new_tunnel).await;
 
+        self.emit(TunnelEvent::Created(info.clone()));
         Ok(info)
     }
 
@@ -272,7 +316,7 @@ impl AppService {
         }
 
         // Cloudflare sync.
-        if let Some(sync) = &self.tunnel_sync {
+        if let Some(sync) = self.tunnel_sync() {
             let enabled_changed = updated.enabled != old_enabled;
             let domain_changed = updated.domain != old_domain;
 
@@ -300,6 +344,7 @@ impl AppService {
             self.tunnel_manager.restart_tunnel(&req.name, updated).await;
         }
 
+        self.emit(TunnelEvent::Updated(info.clone()));
         Ok(info)
     }
 
@@ -333,7 +378,7 @@ impl AppService {
 
         // Cloudflare: remove ingress + DNS.
         if tunnel.enabled
-            && let Some(sync) = &self.tunnel_sync
+            && let Some(sync) = self.tunnel_sync()
             && let Err(e) = sync.remove_single_tunnel(&tunnel.domain).await
         {
             tracing::warn!("Cloudflare remove_single_tunnel failed: {e}");
@@ -342,15 +387,14 @@ impl AppService {
         // Stop local proxy.
         self.tunnel_manager.stop_tunnel(&req.name).await;
 
-        Ok(TunnelDeletedResponse { name: req.name })
+        let resp = TunnelDeletedResponse { name: req.name };
+        self.emit(TunnelEvent::Deleted(resp.clone()));
+        Ok(resp)
     }
 
     pub async fn sync_tunnels(&self) -> Result<SyncReportResponse, String> {
-        let sync = match &self.tunnel_sync {
-            Some(s) => s.clone(),
-            None => {
-                return Err("Cloudflare integration is not configured".to_string());
-            }
+        let Some(sync) = self.tunnel_sync() else {
+            return Err("Cloudflare integration is not configured".to_string());
         };
 
         let cfg = self.config.read().await;
@@ -371,11 +415,8 @@ impl AppService {
         &self,
         req: ConfirmRemoveHostsRequest,
     ) -> Result<SyncReportResponse, String> {
-        let sync = match &self.tunnel_sync {
-            Some(s) => s.clone(),
-            None => {
-                return Err("Cloudflare integration is not configured".to_string());
-            }
+        let Some(sync) = self.tunnel_sync() else {
+            return Err("Cloudflare integration is not configured".to_string());
         };
 
         match sync.remove_hosts(&req.hosts).await {
@@ -516,17 +557,17 @@ impl AppService {
             }
         };
 
-        let service_running = if configured {
-            CloudflaredService::is_running().await
+        let connector = if configured {
+            *self.connector.borrow()
         } else {
-            false
+            ConnectorState::Stopped
         };
 
         CloudflareStatusResponse {
             configured,
             tunnel_id,
             tunnel_name,
-            service_running,
+            connector,
         }
     }
 
@@ -603,5 +644,143 @@ pub fn websocket_message_to_base64(
         direction: message.direction.clone(),
         message_type: message.message_type.clone(),
         payload: base64::engine::general_purpose::STANDARD.encode(&message.payload),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloudflare::CloudflareClient;
+
+    fn make_service(cloudflare: bool) -> AppService {
+        let mut config = Config::default_config();
+        if cloudflare {
+            config.cloudflare = Some(crate::config::CloudflareConfig {
+                api_token: "tok".into(),
+                account_id: "acc".into(),
+                zone_id: "zone".into(),
+                tunnel_id: Some("tid".into()),
+                tunnel_name: "td".into(),
+                tunnel_token: None,
+                manage_cloudflared: true,
+            });
+        }
+        let request_storage = Arc::new(RequestStorage::new(10));
+        let websocket_storage = Arc::new(WebSocketMessageStorage::new(10));
+        let tunnel_manager = Arc::new(TunnelManager::new(
+            &config,
+            request_storage.clone(),
+            websocket_storage.clone(),
+        ));
+        AppService::new(
+            Arc::new(RwLock::new(config)),
+            tunnel_manager,
+            request_storage,
+            websocket_storage,
+        )
+    }
+
+    fn socket_in(dir: &tempfile::TempDir, name: &str) -> Option<String> {
+        Some(dir.path().join(name).to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn tunnel_changes_are_broadcast_as_events() {
+        let service = make_service(false);
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = service.subscribe_events();
+
+        service
+            .create_tunnel(CreateTunnelRequest {
+                name: "api".into(),
+                domain: "api.example.com".into(),
+                socket_path: socket_in(&dir, "api.sock"),
+                target_port: 4000,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(events.recv().await.unwrap(), TunnelEvent::Created(i) if i.name == "api"));
+
+        service
+            .update_tunnel(UpdateTunnelRequest {
+                name: "api".into(),
+                domain: None,
+                socket_path: None,
+                target_port: Some(4001),
+                enabled: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(events.recv().await.unwrap(), TunnelEvent::Updated(i) if i.destination == 4001)
+        );
+
+        service
+            .delete_tunnel(DeleteTunnelRequest { name: "api".into() })
+            .await
+            .unwrap();
+        assert!(matches!(events.recv().await.unwrap(), TunnelEvent::Deleted(d) if d.name == "api"));
+        service.tunnel_manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_change_emits_no_event() {
+        let service = make_service(false);
+        let mut events = service.subscribe_events();
+        assert!(
+            service
+                .delete_tunnel(DeleteTunnelRequest {
+                    name: "ghost".into()
+                })
+                .await
+                .is_err()
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_is_unavailable_until_set() {
+        let service = make_service(true);
+        assert!(service.tunnel_sync().is_none());
+        assert!(service.sync_tunnels().await.is_err());
+
+        let client = CloudflareClient::new("tok", "acc", "zone").unwrap();
+        let sync = Arc::new(TunnelSync::new(client, "tid"));
+        assert!(service.set_tunnel_sync(sync.clone()));
+        assert!(
+            !service.set_tunnel_sync(sync),
+            "second set must be rejected"
+        );
+        assert!(service.tunnel_sync().is_some());
+    }
+
+    #[tokio::test]
+    async fn cloudflare_status_reports_connector_state() {
+        let service = make_service(true);
+        assert_eq!(
+            service.get_cloudflare_status().await.connector,
+            ConnectorState::Stopped
+        );
+        service
+            .connector_sender()
+            .send_replace(ConnectorState::Connected);
+        let status = service.get_cloudflare_status().await;
+        assert!(status.configured);
+        assert_eq!(status.connector, ConnectorState::Connected);
+        assert_eq!(
+            *service.subscribe_connector().borrow(),
+            ConnectorState::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_cloudflare_reports_stopped_connector() {
+        let service = make_service(false);
+        service
+            .connector_sender()
+            .send_replace(ConnectorState::Connected);
+        let status = service.get_cloudflare_status().await;
+        assert!(!status.configured);
+        assert_eq!(status.connector, ConnectorState::Stopped);
     }
 }

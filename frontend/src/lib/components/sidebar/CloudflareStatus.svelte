@@ -1,16 +1,35 @@
 <script lang="ts">
-  import type { CloudflareStatus } from "$lib/types";
+  import type { CloudflareStatus, ConnectorState } from "$lib/types";
 
   let { status }: { status: CloudflareStatus } = $props();
+
+  const CONNECTOR_DISPLAY: Record<
+    ConnectorState,
+    { label: string; tone: "green" | "yellow" | "blue" | "red" | "dim"; hint: string }
+  > = {
+    Connected: { label: "CONNECTED", tone: "green", hint: "cloudflared is connected" },
+    Starting: { label: "STARTING", tone: "yellow", hint: "cloudflared is connecting" },
+    External: {
+      label: "EXTERNAL",
+      tone: "blue",
+      hint: "cloudflared is managed outside TunnelDesk (manage_cloudflared = false)",
+    },
+    NotInstalled: {
+      label: "NOT INSTALLED",
+      tone: "red",
+      hint: "cloudflared was not found on PATH",
+    },
+    Stopped: { label: "STOPPED", tone: "dim", hint: "cloudflared is not running" },
+  };
+
+  let display = $derived(CONNECTOR_DISPLAY[status.connector] ?? CONNECTOR_DISPLAY.Stopped);
 </script>
 
 <div class="cf-status">
-  <div class="cf-row">
-    <span class="cf-indicator" class:on={status.serviceRunning}></span>
+  <div class="cf-row" title={display.hint}>
+    <span class="cf-indicator {display.tone}" data-testid="cf-indicator"></span>
     <span class="cf-label">CLOUDFLARE</span>
-    <span class="cf-val" class:green={status.serviceRunning} class:dim={!status.serviceRunning}>
-      {status.serviceRunning ? "RUNNING" : "STOPPED"}
-    </span>
+    <span class="cf-val {display.tone}">{display.label}</span>
   </div>
   {#if status.tunnelName}
     <div class="cf-tunnel-name">{status.tunnelName}</div>
@@ -40,9 +59,18 @@
     background: var(--dim);
     flex-shrink: 0;
   }
-  .cf-indicator.on {
+  .cf-indicator.green {
     background: var(--green);
     box-shadow: 0 0 5px var(--green);
+  }
+  .cf-indicator.yellow {
+    background: var(--yellow);
+  }
+  .cf-indicator.blue {
+    background: var(--blue);
+  }
+  .cf-indicator.red {
+    background: var(--red);
   }
 
   .cf-label {
@@ -59,6 +87,15 @@
   }
   .cf-val.green {
     color: var(--green);
+  }
+  .cf-val.yellow {
+    color: var(--yellow);
+  }
+  .cf-val.blue {
+    color: var(--blue);
+  }
+  .cf-val.red {
+    color: var(--red);
   }
   .cf-val.dim {
     color: var(--dim);

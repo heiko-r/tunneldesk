@@ -1,5 +1,5 @@
 import { SvelteMap } from "svelte/reactivity";
-import type { CloudflareStatus, SyncReport, Tunnel, TunneledRequest } from "./types";
+import type { CloudflareStatus, CoreStatus, SyncReport, Tunnel, TunneledRequest } from "./types";
 
 /** Global reactive store for all tunnels and their captured requests. */
 export const storage: { tunnels: Tunnel[]; requests: SvelteMap<string, TunneledRequest[]> } =
@@ -10,6 +10,9 @@ export const storage: { tunnels: Tunnel[]; requests: SvelteMap<string, TunneledR
 
 /** Cloudflare integration status, populated by GetCloudflareStatus responses. */
 export const cloudflareStatus: { value: CloudflareStatus | null } = $state({ value: null });
+
+/** Status of the shared core, populated by CoreStatus and ShuttingDown messages. */
+export const coreStatus: { value: CoreStatus | null } = $state({ value: null });
 
 /** Latest sync report, populated by SyncReport responses. */
 export const lastSyncReport: { value: SyncReport | null } = $state({ value: null });
@@ -53,9 +56,17 @@ export function updateTunnel(updated: Tunnel) {
   storage.tunnels = storage.tunnels.map((t) => (t.name === updated.name ? updated : t));
 }
 
-/** Adds a new tunnel to the list. */
+/**
+ * Adds a new tunnel to the list, or replaces the existing entry with the same name.
+ * Tunnel changes are broadcast to every attached client, so the client that made
+ * the change receives the same tunnel twice.
+ */
 export function addTunnel(tunnel: Tunnel) {
-  storage.tunnels = [...storage.tunnels, tunnel];
+  if (storage.tunnels.some((t) => t.name === tunnel.name)) {
+    updateTunnel(tunnel);
+  } else {
+    storage.tunnels = [...storage.tunnels, tunnel];
+  }
 }
 
 /** Removes a tunnel from the list by name. */

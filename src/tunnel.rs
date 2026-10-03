@@ -123,28 +123,6 @@ impl TunnelManager {
     pub async fn is_tunnel_running(&self, name: &str) -> bool {
         self.handles.lock().await.contains_key(name)
     }
-
-    /// Blocks until Ctrl-C or SIGTERM is received.
-    pub async fn wait_for_shutdown_signal(&self) {
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, shutting down...");
-                }
-                _ = sigterm.recv() => {
-                    info!("Received SIGTERM, shutting down...");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.ok();
-            info!("Received Ctrl+C, shutting down...");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -178,7 +156,8 @@ mod tests {
                 max_stored_requests: 500,
                 max_request_body_size: 10 * 1024 * 1024, // 10MB
             },
-            gui: GuiConfig { port: 8081 },
+            gui: GuiConfig::with_port(8081),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         }
@@ -205,7 +184,8 @@ mod tests {
                 max_stored_requests: 100,
                 max_request_body_size: 10 * 1024 * 1024,
             },
-            gui: GuiConfig { port: 8081 },
+            gui: GuiConfig::with_port(8081),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         };
@@ -233,7 +213,8 @@ mod tests {
                 max_stored_requests: 1000,
                 max_request_body_size: 10 * 1024 * 1024,
             },
-            gui: GuiConfig { port: 8081 },
+            gui: GuiConfig::with_port(8081),
+            core: Default::default(),
             cloudflare: None,
             config_path: None,
         };

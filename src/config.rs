@@ -16,6 +16,9 @@ pub struct Config {
     /// Configuration for the local web UI server.
     #[serde(default)]
     pub gui: GuiConfig,
+    /// Lifecycle settings for the background core process.
+    #[serde(default)]
+    pub core: CoreConfig,
     /// Optional Cloudflare integration settings.
     #[serde(default)]
     pub cloudflare: Option<CloudflareConfig>,
@@ -42,11 +45,19 @@ pub struct CloudflareConfig {
     /// Connector token for `cloudflared service install`. Populated automatically on first run.
     #[serde(default)]
     pub tunnel_token: Option<String>,
+    /// Whether the core spawns and supervises `cloudflared` itself. Set to
+    /// `false` when the connector is run separately (e.g. as a system service).
+    #[serde(default = "CloudflareConfig::default_manage_cloudflared")]
+    pub manage_cloudflared: bool,
 }
 
 impl CloudflareConfig {
     fn default_tunnel_name() -> String {
         "tunneldesk".to_string()
+    }
+
+    fn default_manage_cloudflared() -> bool {
+        true
     }
 }
 
@@ -116,21 +127,56 @@ impl Default for CaptureConfig {
 /// Configuration for the built-in web UI server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiConfig {
-    /// TCP port the web UI listens on (e.g. `3013`).
+    /// TCP port the web UI listens on (e.g. `3013`). `0` picks a free port.
     #[serde(default = "GuiConfig::default_port")]
     pub port: u16,
+    /// Secret required by every client of the core. Populated automatically on first run.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Extra browser origins allowed to connect, e.g. `http://localhost:5173` for `npm run dev`.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl GuiConfig {
     fn default_port() -> u16 {
         3013
     }
+
+    /// Creates a GUI config listening on `port` with no token or extra origins.
+    pub fn with_port(port: u16) -> Self {
+        GuiConfig {
+            port,
+            access_token: None,
+            allowed_origins: Vec::new(),
+        }
+    }
 }
 
 impl Default for GuiConfig {
     fn default() -> Self {
-        GuiConfig {
-            port: Self::default_port(),
+        Self::with_port(Self::default_port())
+    }
+}
+
+/// Lifecycle settings for the background core process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreConfig {
+    /// Seconds a background core keeps running without attached clients or activity.
+    #[serde(default = "CoreConfig::default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl CoreConfig {
+    fn default_idle_timeout_secs() -> u64 {
+        30
+    }
+}
+
+impl Default for CoreConfig {
+    fn default() -> Self {
+        CoreConfig {
+            idle_timeout_secs: Self::default_idle_timeout_secs(),
         }
     }
 }
@@ -203,12 +249,81 @@ impl Config {
             if let Some(ref token) = cf.tunnel_token {
                 cf_table["tunnel_token"] = toml_edit::value(token.clone());
             }
+            if !cf.manage_cloudflared {
+                cf_table["manage_cloudflared"] = toml_edit::value(false);
+            }
         }
 
-        std::fs::write(path, doc.to_string())?;
+        let gui_table = doc["gui"].or_insert(toml_edit::Item::Table(toml_edit::Table::default()));
+        gui_table["port"] = toml_edit::value(i64::from(self.gui.port));
+        if let Some(ref token) = self.gui.access_token {
+            gui_table["access_token"] = toml_edit::value(token.clone());
+        }
+        if !self.gui.allowed_origins.is_empty() {
+            let origins: toml_edit::Array = self.gui.allowed_origins.iter().collect();
+            gui_table["allowed_origins"] = toml_edit::value(origins);
+        }
+
+        write_private(path, doc.to_string().as_bytes())?;
         Ok(())
     }
 
+    /// Loads the config at `path`, creating it with defaults if it does not exist.
+    pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            return Self::from_file(path);
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut config = Self::default_config();
+        config.config_path = Some(path.to_path_buf());
+        config.save_to_file(path)?;
+        Ok(config)
+    }
+
+    /// Generates `gui.access_token` if missing. Returns `true` if a token was created.
+    pub fn ensure_access_token(&mut self) -> bool {
+        if self.gui.access_token.is_some() {
+            return false;
+        }
+        self.gui.access_token = Some(generate_access_token());
+        true
+    }
+}
+
+/// Generates a random 32-byte URL-safe access token.
+pub fn generate_access_token() -> String {
+    use base64::Engine as _;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Writes `contents` to `path`, restricting permissions to the owner on Unix
+/// because the config holds secrets (API token, tunnel token, access token).
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+impl Config {
     /// Returns a built-in default configuration suitable for development.
     pub fn default_config() -> Self {
         Config {
@@ -221,7 +336,8 @@ impl Config {
                 max_stored_requests: 1000,
                 max_request_body_size: 10485760, // 10MB
             },
-            gui: GuiConfig { port: 8081 },
+            gui: GuiConfig::with_port(8081),
+            core: CoreConfig::default(),
             cloudflare: None,
             config_path: None,
         }
@@ -567,5 +683,89 @@ enabled = true
         // Existing fields preserved
         assert_eq!(cf.api_token, "tok");
         assert_eq!(cf.account_id, "acc");
+        assert!(cf.manage_cloudflared);
+    }
+
+    #[test]
+    fn test_new_sections_default_when_absent() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("minimal.toml");
+        fs::write(&file_path, "[gui]\nport = 0\n").unwrap();
+
+        let config = Config::from_file(&file_path).unwrap();
+        assert_eq!(config.gui.port, 0);
+        assert!(config.gui.access_token.is_none());
+        assert!(config.gui.allowed_origins.is_empty());
+        assert_eq!(config.core.idle_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_manage_cloudflared_false_round_trips() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("external.toml");
+        fs::write(
+            &file_path,
+            "[cloudflare]\napi_token = \"t\"\naccount_id = \"a\"\nzone_id = \"z\"\nmanage_cloudflared = false\n",
+        )
+        .unwrap();
+
+        let config = Config::from_file(&file_path).unwrap();
+        assert!(!config.cloudflare.as_ref().unwrap().manage_cloudflared);
+        config.save_to_file(&file_path).unwrap();
+        let reloaded = Config::from_file(&file_path).unwrap();
+        assert!(!reloaded.cloudflare.unwrap().manage_cloudflared);
+    }
+
+    #[test]
+    fn test_access_token_and_origins_round_trip() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("token.toml");
+        let mut config = Config::default_config();
+        assert!(config.ensure_access_token());
+        assert!(!config.ensure_access_token(), "existing token must be kept");
+        config.gui.allowed_origins = vec!["http://localhost:5173".to_string()];
+        config.gui.port = 0;
+        config.save_to_file(&file_path).unwrap();
+
+        let reloaded = Config::from_file(&file_path).unwrap();
+        assert_eq!(reloaded.gui.access_token, config.gui.access_token);
+        assert_eq!(reloaded.gui.allowed_origins, vec!["http://localhost:5173"]);
+        assert_eq!(reloaded.gui.port, 0);
+    }
+
+    #[test]
+    fn test_generate_access_token_is_random_and_url_safe() {
+        let a = generate_access_token();
+        let b = generate_access_token();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 43);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+    }
+
+    #[test]
+    fn test_load_or_create_writes_default_config() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("nested/dir/config.toml");
+        let config = Config::load_or_create(&file_path).unwrap();
+        assert!(file_path.exists());
+        assert_eq!(config.config_path.as_deref(), Some(file_path.as_path()));
+        let reloaded = Config::from_file(&file_path).unwrap();
+        assert_eq!(reloaded.gui.port, config.gui.port);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_to_file_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("private.toml");
+        fs::write(&file_path, "").unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+        Config::default_config().save_to_file(&file_path).unwrap();
+        let mode = fs::metadata(&file_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
