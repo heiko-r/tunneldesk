@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -32,7 +33,7 @@ enum TeeReaderState {
     CollectingBody {
         /// Offset into `buf` where the body begins.
         header_end: usize,
-        /// Declared `Content-Length` value (0 if absent).
+        /// Declared `Content-Length` value (always > 0).
         content_length: usize,
         /// `min(content_length, max_body_size)` – the number of body bytes to
         /// capture and buffer.
@@ -43,6 +44,198 @@ enum TeeReaderState {
     /// `max_body_size`; we are counting down the uncaptured tail bytes without
     /// buffering them so that the connection continues to be proxied normally.
     DrainBody { bytes_remaining: usize },
+
+    /// Buffering a `Transfer-Encoding: chunked` body (framing included, so the
+    /// capture worker can decode it) until the message ends or `max_body_size`
+    /// body bytes are buffered.
+    ChunkedBody {
+        header_end: usize,
+        /// `buf[..parsed_to]` has been fed through `framing`.
+        parsed_to: usize,
+        framing: ChunkedFraming,
+    },
+
+    /// Capture has been dispatched for a chunked message that exceeds
+    /// `max_body_size`; tracking its framing without buffering to find its end.
+    ChunkedDrain { framing: ChunkedFraming },
+
+    /// A response without `Content-Length` or chunked framing: its body ends
+    /// when the connection closes.  Buffering up to `max_body_size` bytes.
+    UntilClose { header_end: usize },
+
+    /// The rest of the stream belongs to an `UntilClose` body that has already
+    /// been captured.
+    IgnoreRest,
+}
+
+/// How the body of an HTTP/1.1 message is delimited (RFC 9112 §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFraming {
+    None,
+    Length(usize),
+    Chunked,
+    UntilClose,
+}
+
+/// The parts of an HTTP message head that determine how the stream continues.
+#[derive(Debug, Default, PartialEq)]
+struct MessageHead {
+    /// Status code for responses, `None` for requests.
+    status: Option<u16>,
+    is_head_request: bool,
+    content_length: Option<usize>,
+    chunked: bool,
+    /// A WebSocket upgrade request, or a `101 Switching Protocols` response.
+    websocket_upgrade: bool,
+}
+
+impl MessageHead {
+    fn parse(head: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(head);
+        let mut lines = text.lines();
+        let first_line = lines.next().unwrap_or_default();
+        let status = first_line
+            .strip_prefix("HTTP/")
+            .and_then(|rest| rest.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok());
+        let mut parsed = Self {
+            status,
+            is_head_request: first_line.starts_with("HEAD "),
+            ..Self::default()
+        };
+        let mut upgrade_websocket = false;
+        let mut connection_upgrade = false;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let (name, value) = (name.trim(), value.trim());
+            if name.eq_ignore_ascii_case("content-length") {
+                parsed.content_length = value.parse().ok();
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                parsed.chunked = crate::http_body::is_chunked(value);
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                upgrade_websocket = value.to_ascii_lowercase().contains("websocket");
+            } else if name.eq_ignore_ascii_case("connection") {
+                connection_upgrade = value.to_ascii_lowercase().contains("upgrade");
+            }
+        }
+        parsed.websocket_upgrade = status == Some(101) || (upgrade_websocket && connection_upgrade);
+        parsed
+    }
+
+    /// An informational response (e.g. `100 Continue`) that precedes the final
+    /// response to the same request.
+    fn is_interim(&self) -> bool {
+        matches!(self.status, Some(100..=199)) && self.status != Some(101)
+    }
+
+    fn framing(&self, response_to_head: bool) -> BodyFraming {
+        if let Some(status) = self.status
+            && (response_to_head || (100..200).contains(&status) || status == 204 || status == 304)
+        {
+            return BodyFraming::None;
+        }
+        if self.chunked {
+            return BodyFraming::Chunked;
+        }
+        match (self.content_length, self.status) {
+            (Some(0), _) | (None, None) => BodyFraming::None,
+            (Some(length), _) => BodyFraming::Length(length),
+            (None, Some(_)) => BodyFraming::UntilClose,
+        }
+    }
+}
+
+/// Incremental parser for `Transfer-Encoding: chunked` framing.  It only finds
+/// where a message ends; the capture worker decodes the captured bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkedFraming {
+    /// Reading a chunk-size line.  `in_ext` is set once a non-hex byte (the
+    /// start of a chunk extension) was seen; the rest of the line is ignored.
+    Size {
+        size: usize,
+        in_ext: bool,
+    },
+    Data {
+        remaining: usize,
+    },
+    /// Skipping the line break after chunk data.
+    DataEnd,
+    /// Reading the trailer section after the last chunk, which ends with an
+    /// empty line.
+    Trailer {
+        line_len: usize,
+    },
+}
+
+impl ChunkedFraming {
+    const START: Self = Self::Size {
+        size: 0,
+        in_ext: false,
+    };
+
+    /// Consumes `data`.  Returns `Some(n)` when the message ends after the
+    /// first `n` bytes, or `None` when all of `data` belongs to the message.
+    fn advance(&mut self, data: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < data.len() {
+            match *self {
+                Self::Data { remaining } => {
+                    let take = remaining.min(data.len() - i);
+                    i += take;
+                    *self = if take == remaining {
+                        Self::DataEnd
+                    } else {
+                        Self::Data {
+                            remaining: remaining - take,
+                        }
+                    };
+                }
+                Self::Size { size, in_ext } => {
+                    let byte = data[i];
+                    i += 1;
+                    *self = match byte {
+                        b'\n' if size == 0 => Self::Trailer { line_len: 0 },
+                        b'\n' => Self::Data { remaining: size },
+                        b'\r' => continue,
+                        _ if in_ext => continue,
+                        _ => match (byte as char).to_digit(16) {
+                            Some(digit) => Self::Size {
+                                size: size.saturating_mul(16).saturating_add(digit as usize),
+                                in_ext,
+                            },
+                            None => Self::Size { size, in_ext: true },
+                        },
+                    };
+                }
+                Self::DataEnd => {
+                    if data[i] == b'\n' {
+                        *self = Self::START;
+                    }
+                    i += 1;
+                }
+                Self::Trailer { line_len } => {
+                    let byte = data[i];
+                    i += 1;
+                    match byte {
+                        b'\n' if line_len == 0 => {
+                            *self = Self::START;
+                            return Some(i);
+                        }
+                        b'\n' => *self = Self::Trailer { line_len: 0 },
+                        b'\r' => {}
+                        _ => {
+                            *self = Self::Trailer {
+                                line_len: line_len + 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 struct TeeReader<R> {
@@ -61,6 +254,10 @@ struct TeeReader<R> {
     /// connection.  Before the upgrade, bytes are only ever interpreted as HTTP.
     /// After the upgrade, bytes are only ever interpreted as WebSocket frames.
     websocket_upgraded: bool,
+    /// For each request on this connection still awaiting its response,
+    /// whether it is a HEAD request (whose response has no body).  Shared by
+    /// the readers of both directions: requests push, final responses pop.
+    head_requests: Arc<Mutex<VecDeque<bool>>>,
 }
 
 impl<R> TeeReader<R> {
@@ -82,7 +279,15 @@ impl<R> TeeReader<R> {
             buf: Vec::new(),
             state: TeeReaderState::FindingHeaders { scan_pos: 0 },
             websocket_upgraded: false,
+            head_requests: Arc::default(),
         }
+    }
+
+    /// Shares the request log with `other`, the reader for the opposite
+    /// direction of the same connection.
+    fn sharing_request_log_with<O>(mut self, other: &TeeReader<O>) -> Self {
+        self.head_requests = other.head_requests.clone();
+        self
     }
 }
 
@@ -94,6 +299,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TeeReader<R> {
     ) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
         let filled_len = buf.filled().len();
+        let had_capacity = buf.remaining() > 0;
 
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
@@ -101,6 +307,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for TeeReader<R> {
                 if !new_data.is_empty() {
                     // Capture side-channel: does not affect forwarded bytes.
                     this.advance_state(new_data);
+                } else if had_capacity {
+                    this.finish();
                 }
                 Poll::Ready(Ok(()))
             }
@@ -174,17 +382,39 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                         }
                         Some(rel_pos) => {
                             let header_end = search_from + rel_pos + 4;
-                            let content_length =
-                                Self::extract_content_length(&self.buf[..header_end]).unwrap_or(0);
-                            let capture_limit = content_length.min(self.max_body_size);
-                            self.state = TeeReaderState::CollectingBody {
-                                header_end,
-                                content_length,
-                                capture_limit,
+                            let head = MessageHead::parse(&self.buf[..header_end]);
+                            let response_to_head = self.track_request(&head);
+                            self.state = match head.framing(response_to_head) {
+                                BodyFraming::None => {
+                                    self.dispatch_http_message(self.buf[..header_end].to_vec());
+                                    // The upgrade request (client → server) and the
+                                    // 101 response (server → client) are each seen by
+                                    // their respective TeeReader, so both switch to
+                                    // frame parsing at the right moment.
+                                    if head.websocket_upgrade {
+                                        self.websocket_upgraded = true;
+                                    }
+                                    self.buf.drain(0..header_end);
+                                    TeeReaderState::FindingHeaders { scan_pos: 0 }
+                                }
+                                BodyFraming::Length(content_length) => {
+                                    TeeReaderState::CollectingBody {
+                                        header_end,
+                                        content_length,
+                                        capture_limit: content_length.min(self.max_body_size),
+                                    }
+                                }
+                                BodyFraming::Chunked => TeeReaderState::ChunkedBody {
+                                    header_end,
+                                    parsed_to: header_end,
+                                    framing: ChunkedFraming::START,
+                                },
+                                BodyFraming::UntilClose => {
+                                    TeeReaderState::UntilClose { header_end }
+                                }
                             };
-                            // Fall through to CollectingBody on the next
-                            // iteration – the buffer may already hold enough
-                            // body bytes to dispatch immediately.
+                            // Loop: the buffer may already hold body bytes or
+                            // the next message.
                         }
                     }
                 }
@@ -200,24 +430,7 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
 
                     let body_in_buf = self.buf.len().saturating_sub(header_end);
 
-                    if content_length == 0 {
-                        // No body (or unknown length): capture headers only.
-                        let headers = &self.buf[..header_end];
-                        self.dispatch_http_message(headers.to_vec());
-                        // Detect WebSocket upgrade so future bytes are parsed as
-                        // frames rather than HTTP.  The upgrade request (client →
-                        // server) and the 101 response (server → client) are each
-                        // seen by their respective TeeReader, so both independently
-                        // set this flag at the right moment.
-                        if Self::is_websocket_upgrade_headers(headers)
-                            || Self::is_101_switching_protocols(headers)
-                        {
-                            self.websocket_upgraded = true;
-                        }
-                        self.buf.drain(0..header_end);
-                        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
-                        // Loop: the buffer may contain the next message.
-                    } else if body_in_buf < capture_limit {
+                    if body_in_buf < capture_limit {
                         // Still waiting for more body bytes.
                         break;
                     } else {
@@ -234,12 +447,76 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                         } else {
                             // Body tail not yet received; switch to drain mode.
                             let bytes_remaining = total_message - self.buf.len();
-                            self.buf.clear(); // Release memory – no longer needed.
+                            self.release_buf();
                             self.state = TeeReaderState::DrainBody { bytes_remaining };
                             break;
                         }
                     }
                 }
+
+                // ── Buffering a chunked body up to max_body_size ──────────
+                TeeReaderState::ChunkedBody {
+                    header_end,
+                    parsed_to,
+                    mut framing,
+                } => {
+                    self.buf.extend_from_slice(remaining);
+                    remaining = b"";
+
+                    let capture_end = header_end.saturating_add(self.max_body_size);
+                    match framing.advance(&self.buf[parsed_to..]) {
+                        Some(consumed) => {
+                            let message_end = parsed_to + consumed;
+                            self.dispatch_http_message(
+                                self.buf[..message_end.min(capture_end)].to_vec(),
+                            );
+                            self.buf.drain(0..message_end);
+                            self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                            // Loop: leftover bytes may start the next message.
+                        }
+                        None if self.buf.len() >= capture_end => {
+                            self.dispatch_http_message(self.buf[..capture_end].to_vec());
+                            self.release_buf();
+                            self.state = TeeReaderState::ChunkedDrain { framing };
+                            break;
+                        }
+                        None => {
+                            self.state = TeeReaderState::ChunkedBody {
+                                header_end,
+                                parsed_to: self.buf.len(),
+                                framing,
+                            };
+                            break;
+                        }
+                    }
+                }
+
+                // ── Following chunked framing without buffering ──────────
+                TeeReaderState::ChunkedDrain { mut framing } => match framing.advance(remaining) {
+                    Some(consumed) => {
+                        remaining = &remaining[consumed..];
+                        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                        // Loop: leftover bytes in `remaining` start the next message.
+                    }
+                    None => {
+                        self.state = TeeReaderState::ChunkedDrain { framing };
+                        break;
+                    }
+                },
+
+                // ── Buffering a body that ends with the connection ────────
+                TeeReaderState::UntilClose { header_end } => {
+                    self.buf.extend_from_slice(remaining);
+                    let capture_end = header_end.saturating_add(self.max_body_size);
+                    if self.buf.len() >= capture_end {
+                        self.dispatch_http_message(self.buf[..capture_end].to_vec());
+                        self.release_buf();
+                        self.state = TeeReaderState::IgnoreRest;
+                    }
+                    break;
+                }
+
+                TeeReaderState::IgnoreRest => break,
 
                 // ── Counting remaining body bytes without buffering ────────
                 TeeReaderState::DrainBody { bytes_remaining } => {
@@ -259,6 +536,49 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                 }
             }
         }
+    }
+
+    /// Called at the end of the stream: dispatches a message whose body was
+    /// ended (`UntilClose`) or cut short by the connection closing.
+    fn finish(&mut self) {
+        let capture_end = match self.state {
+            TeeReaderState::CollectingBody {
+                header_end,
+                capture_limit,
+                ..
+            } => header_end + capture_limit,
+            TeeReaderState::ChunkedBody { header_end, .. }
+            | TeeReaderState::UntilClose { header_end } => {
+                header_end.saturating_add(self.max_body_size)
+            }
+            _ => return,
+        };
+        let end = capture_end.min(self.buf.len());
+        self.dispatch_http_message(self.buf[..end].to_vec());
+        self.release_buf();
+        self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+    }
+
+    /// Records a request in the shared log, or matches a final response to
+    /// its request.  Returns `true` for a response to a HEAD request.
+    fn track_request(&self, head: &MessageHead) -> bool {
+        let mut head_requests = self
+            .head_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match head.status {
+            None => {
+                head_requests.push_back(head.is_head_request);
+                false
+            }
+            Some(_) if head.is_interim() => false,
+            Some(_) => head_requests.pop_front().unwrap_or(false),
+        }
+    }
+
+    /// Drops the buffer's allocation, which may be up to `max_body_size`.
+    fn release_buf(&mut self) {
+        self.buf = Vec::new();
     }
 
     fn dispatch_http_message(&self, message: Vec<u8>) {
@@ -315,32 +635,6 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
         None
     }
 
-    /// Returns `true` if `headers` contain both `Upgrade: websocket` and
-    /// `Connection: … upgrade …` (case-insensitive), indicating a WebSocket
-    /// upgrade request.
-    fn is_websocket_upgrade_headers(headers: &[u8]) -> bool {
-        let text = String::from_utf8_lossy(headers);
-        let has_upgrade = text.lines().any(|l| {
-            let lower = l.to_lowercase();
-            lower.starts_with("upgrade:") && lower.contains("websocket")
-        });
-        let has_connection = text.lines().any(|l| {
-            let lower = l.to_lowercase();
-            lower.starts_with("connection:") && lower.contains("upgrade")
-        });
-        has_upgrade && has_connection
-    }
-
-    /// Returns `true` if `headers` is an HTTP 101 Switching Protocols response.
-    fn is_101_switching_protocols(headers: &[u8]) -> bool {
-        String::from_utf8_lossy(headers)
-            .lines()
-            .next()
-            .and_then(|l| l.split(' ').nth(1))
-            .map(|code| code == "101")
-            .unwrap_or(false)
-    }
-
     fn try_extract_websocket_frame(buffer: &[u8]) -> anyhow::Result<Option<(Vec<u8>, usize)>> {
         // WebSocket frame format: https://tools.ietf.org/html/rfc6455#section-5.2
         if buffer.len() < 2 {
@@ -382,19 +676,6 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
 
         Ok(None)
     }
-
-    fn extract_content_length(data: &[u8]) -> Option<usize> {
-        let data_str = String::from_utf8_lossy(data);
-        for line in data_str.lines() {
-            if line.to_lowercase().starts_with("content-length:") {
-                let parts: Vec<&str> = line.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    return parts[1].trim().parse().ok();
-                }
-            }
-        }
-        None
-    }
 }
 
 /// Listens on a Unix domain socket and forwards each connection to a local TCP
@@ -423,6 +704,7 @@ impl Proxy {
             (*websocket_storage).clone(),
             stdout_level,
             log_body_limit,
+            max_body_size,
         );
         // Spawn the capture worker as a background task.  It will process all
         // queued capture events until the last `Capture` sender is dropped (i.e.
@@ -557,7 +839,8 @@ impl Proxy {
             connection_id,
             "←".to_string(),
             max_body_size,
-        );
+        )
+        .sharing_request_log_with(&client_to_server_tee);
 
         let (bytes_sent, bytes_received) = tokio::join!(
             async {
@@ -762,6 +1045,7 @@ mod tests {
             (*websocket_storage).clone(),
             "debug",
             1024,
+            1024 * 1024,
         );
         tokio::spawn(worker.run());
         (capture, storage)
@@ -1150,44 +1434,331 @@ mod tests {
         assert!(!TeeReader::<MockReader>::starts_with_http(b""));
     }
 
-    // ── extract_content_length ───────────────────────────────────────────
+    // ── MessageHead ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_extract_content_length() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\n\r\n";
+    fn test_head_content_length() {
+        let head = MessageHead::parse(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 42\r\n\r\n",
+        );
+        assert_eq!(head.status, Some(200));
+        assert_eq!(head.content_length, Some(42));
+        assert_eq!(head.framing(false), BodyFraming::Length(42));
+    }
+
+    #[test]
+    fn test_head_content_length_case_insensitive() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n");
+        assert_eq!(head.content_length, Some(100));
+    }
+
+    #[test]
+    fn test_head_content_length_invalid_format() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n");
+        assert_eq!(head.content_length, None);
+    }
+
+    #[test]
+    fn test_head_content_length_with_spaces() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\nContent-Length:   25   \r\n\r\n");
+        assert_eq!(head.content_length, Some(25));
+    }
+
+    #[test]
+    fn test_head_chunked_takes_precedence_over_content_length() {
+        let head = MessageHead::parse(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert_eq!(head.framing(false), BodyFraming::Chunked);
+    }
+
+    #[test]
+    fn test_head_response_without_length_reads_until_close() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n");
+        assert_eq!(head.framing(false), BodyFraming::UntilClose);
+    }
+
+    #[test]
+    fn test_head_request_without_length_has_no_body() {
+        let head = MessageHead::parse(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(head.status, None);
+        assert!(!head.is_head_request);
+        assert_eq!(head.framing(false), BodyFraming::None);
+    }
+
+    #[test]
+    fn test_head_chunked_request() {
+        let head = MessageHead::parse(b"POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        assert_eq!(head.framing(false), BodyFraming::Chunked);
+    }
+
+    #[test]
+    fn test_head_zero_content_length_has_no_body() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(head.framing(false), BodyFraming::None);
+    }
+
+    #[test]
+    fn test_head_bodyless_statuses() {
+        for status in [
+            "100 Continue",
+            "103 Early Hints",
+            "204 No Content",
+            "304 Not Modified",
+        ] {
+            let raw = format!("HTTP/1.1 {status}\r\nContent-Length: 10\r\n\r\n");
+            let head = MessageHead::parse(raw.as_bytes());
+            assert_eq!(head.framing(false), BodyFraming::None, "{status}");
+        }
+    }
+
+    #[test]
+    fn test_head_response_to_head_request_has_no_body() {
+        let head = MessageHead::parse(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n");
+        assert_eq!(head.framing(true), BodyFraming::None);
+    }
+
+    #[test]
+    fn test_head_detects_head_requests() {
+        assert!(MessageHead::parse(b"HEAD / HTTP/1.1\r\n\r\n").is_head_request);
+    }
+
+    #[test]
+    fn test_head_interim_responses() {
+        assert!(MessageHead::parse(b"HTTP/1.1 100 Continue\r\n\r\n").is_interim());
+        assert!(!MessageHead::parse(b"HTTP/1.1 101 Switching Protocols\r\n\r\n").is_interim());
+        assert!(!MessageHead::parse(b"HTTP/1.1 200 OK\r\n\r\n").is_interim());
+        assert!(!MessageHead::parse(b"GET / HTTP/1.1\r\n\r\n").is_interim());
+    }
+
+    #[test]
+    fn test_head_websocket_upgrade() {
+        let request = MessageHead::parse(
+            b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n",
+        );
+        assert!(request.websocket_upgrade);
+        let response = MessageHead::parse(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+        assert!(response.websocket_upgrade);
+        let plain = MessageHead::parse(b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
+        assert!(!plain.websocket_upgrade);
+    }
+
+    // ── ChunkedFraming ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_chunked_framing_finds_message_end() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT";
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(body), Some(body.len() - 4));
+        assert_eq!(framing, ChunkedFraming::START);
+    }
+
+    #[test]
+    fn test_chunked_framing_byte_by_byte() {
+        let body = b"a;ext=1\r\n0123456789\r\n0\r\nTrailer: x\r\n\r\n";
+        let mut framing = ChunkedFraming::START;
+        for (i, byte) in body.iter().enumerate() {
+            let result = framing.advance(std::slice::from_ref(byte));
+            if i == body.len() - 1 {
+                assert_eq!(result, Some(1));
+            } else {
+                assert_eq!(result, None, "byte {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunked_framing_chunk_data_resembling_terminator() {
+        // Chunk data containing "0\r\n\r\n" must not end the message.
+        let body = b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(body), Some(body.len()));
+    }
+
+    #[test]
+    fn test_chunked_framing_incomplete() {
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(b"10\r\nonly part"), None);
+        assert_eq!(framing, ChunkedFraming::Data { remaining: 7 });
+    }
+
+    // ── Dispatched messages ───────────────────────────────────────────────
+
+    /// Runs `data` through a TeeReader delivering `chunk_size` bytes per read
+    /// and returns the raw HTTP messages it dispatched for capture.
+    async fn dispatched(data: &[u8], max_body_size: usize, chunk_size: usize) -> Vec<Vec<u8>> {
+        let (capture, mut rx) = Capture::new_for_testing_channel();
+        let mut reader = TeeReader::new(
+            MockReader::with_chunk_size(data.to_vec(), chunk_size),
+            capture,
+            "test".to_string(),
+            "conn".to_string(),
+            "←".to_string(),
+            max_body_size,
+        );
+        let forwarded = read_all(&mut reader).await;
+        assert_eq!(forwarded, data, "all bytes must be forwarded unchanged");
+        drop(reader);
+        let mut messages = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let crate::capture::CaptureEvent::HttpMessage { raw, .. } = event {
+                messages.push(raw);
+            }
+        }
+        messages
+    }
+
+    const CHUNKED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
+
+    #[tokio::test]
+    async fn test_chunked_response_is_captured_with_body() {
+        for chunk_size in [1, 7, 4096] {
+            let messages = dispatched(CHUNKED_RESPONSE, 65536, chunk_size).await;
+            assert_eq!(
+                messages,
+                vec![CHUNKED_RESPONSE.to_vec()],
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_after_chunked_response_is_captured() {
+        let second = b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
+        let mut data = CHUNKED_RESPONSE.to_vec();
+        data.extend_from_slice(second);
+        for chunk_size in [1, 13, 4096] {
+            let messages = dispatched(&data, 65536, chunk_size).await;
+            assert_eq!(
+                messages,
+                vec![CHUNKED_RESPONSE.to_vec(), second.to_vec()],
+                "chunk size {chunk_size}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_beyond_limit_is_truncated_then_resyncs() {
+        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut data = header.to_vec();
+        for _ in 0..10 {
+            data.extend_from_slice(b"10\r\n0123456789abcdef\r\n");
+        }
+        data.extend_from_slice(b"0\r\n\r\n");
+        let second = b"HTTP/1.1 204 No Content\r\n\r\n";
+        data.extend_from_slice(second);
+
+        for chunk_size in [1, 30, 4096] {
+            let messages = dispatched(&data, 50, chunk_size).await;
+            assert_eq!(messages.len(), 2, "chunk size {chunk_size}");
+            assert_eq!(messages[0], data[..header.len() + 50]);
+            assert_eq!(messages[1], second);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_without_length_is_captured_at_close() {
+        let data = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close";
+        for chunk_size in [1, 4096] {
+            assert_eq!(
+                dispatched(data, 65536, chunk_size).await,
+                vec![data.to_vec()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_without_length_beyond_limit_is_truncated() {
+        let header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mut data = header.to_vec();
+        data.extend_from_slice(&[b'x'; 500]);
+        // Bytes after the body limit are not parsed as further messages.
+        data.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
+        let messages = dispatched(&data, 100, 64).await;
+        assert_eq!(messages, vec![data[..header.len() + 100].to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn test_body_cut_short_by_close_is_captured() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial";
+        assert_eq!(dispatched(data, 65536, 4096).await, vec![data.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn test_bodyless_status_with_content_length_does_not_swallow_next_response() {
+        let first = b"HTTP/1.1 304 Not Modified\r\nContent-Length: 20\r\n\r\n";
+        let second = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut data = first.to_vec();
+        data.extend_from_slice(second);
         assert_eq!(
-            TeeReader::<MockReader>::extract_content_length(data),
-            Some(42)
+            dispatched(&data, 65536, 4096).await,
+            vec![first.to_vec(), second.to_vec()]
         );
     }
 
-    #[test]
-    fn test_extract_content_length_case_insensitive() {
-        let data = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n";
+    #[tokio::test]
+    async fn test_interim_response_before_final_response() {
+        let interim = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let last = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let mut data = interim.to_vec();
+        data.extend_from_slice(last);
         assert_eq!(
-            TeeReader::<MockReader>::extract_content_length(data),
-            Some(100)
+            dispatched(&data, 65536, 4096).await,
+            vec![interim.to_vec(), last.to_vec()]
         );
     }
 
-    #[test]
-    fn test_extract_content_length_no_header() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
-        assert_eq!(TeeReader::<MockReader>::extract_content_length(data), None);
+    #[tokio::test]
+    async fn test_head_response_with_content_length_has_no_body() {
+        let (capture, mut rx) = Capture::new_for_testing_channel();
+        let requests = b"HEAD /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut client = TeeReader::new(
+            MockReader::new(requests.to_vec()),
+            capture.clone(),
+            "test".to_string(),
+            "conn".to_string(),
+            "→".to_string(),
+            65536,
+        );
+        read_all(&mut client).await;
+
+        let head_response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let get_response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let mut responses = head_response.to_vec();
+        responses.extend_from_slice(get_response);
+        let mut server = TeeReader::new(
+            MockReader::new(responses),
+            capture,
+            "test".to_string(),
+            "conn".to_string(),
+            "←".to_string(),
+            65536,
+        )
+        .sharing_request_log_with(&client);
+        read_all(&mut server).await;
+        drop((client, server));
+
+        let mut messages = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let crate::capture::CaptureEvent::HttpMessage { raw, .. } = event {
+                messages.push(raw);
+            }
+        }
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2], head_response);
+        assert_eq!(messages[3], get_response);
     }
 
-    #[test]
-    fn test_extract_content_length_invalid_format() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n";
-        assert_eq!(TeeReader::<MockReader>::extract_content_length(data), None);
-    }
-
-    #[test]
-    fn test_extract_content_length_with_spaces() {
-        let data = b"HTTP/1.1 200 OK\r\nContent-Length:   25   \r\n\r\n";
+    #[tokio::test]
+    async fn test_chunked_request_is_captured_with_body() {
+        let request =
+            b"POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\n\r\n";
+        let next = b"GET /next HTTP/1.1\r\n\r\n";
+        let mut data = request.to_vec();
+        data.extend_from_slice(next);
         assert_eq!(
-            TeeReader::<MockReader>::extract_content_length(data),
-            Some(25)
+            dispatched(&data, 65536, 5).await,
+            vec![request.to_vec(), next.to_vec()]
         );
     }
 

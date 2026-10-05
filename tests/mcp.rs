@@ -487,7 +487,18 @@ async fn mcp_client_cannot_stop_the_core_while_another_client_is_attached() {
 
 /// Serves `hello` to every HTTP request on an ephemeral port.
 async fn spawn_http_target() -> u16 {
+    spawn_http_target_with(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
+        false,
+    )
+    .await
+}
+
+/// Serves the raw `response` to every HTTP request on an ephemeral port,
+/// closing the connection afterwards unless `keep_open`.
+async fn spawn_http_target_with(response: Vec<u8>, keep_open: bool) -> u16 {
     use tokio::io::AsyncReadExt as _;
+    let response = std::sync::Arc::new(response);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -495,6 +506,7 @@ async fn spawn_http_target() -> u16 {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
+            let response = response.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
                 let mut request = Vec::new();
@@ -504,11 +516,8 @@ async fn spawn_http_target() -> u16 {
                         Ok(n) => request.extend_from_slice(&buf[..n]),
                     }
                 }
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-                    )
-                    .await;
+                let _ = stream.write_all(&response).await;
+                while keep_open && matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
                 let _ = stream.shutdown().await;
             });
         }
@@ -587,4 +596,87 @@ async fn tunnel_traffic_is_captured_and_queryable_over_mcp() {
         !socket.exists(),
         "stopping the core removes the tunnel socket"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chunked_compressed_response_is_stored_decoded() {
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let json = br#"{"access_token":"abc","token_type":"bearer","expires_in":3600}"#;
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(json).unwrap();
+    let compressed = gzip.finish().unwrap();
+    let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for chunk in compressed.chunks(16) {
+        response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+        response.extend_from_slice(chunk);
+        response.extend_from_slice(b"\r\n");
+    }
+    response.extend_from_slice(b"0\r\n\r\n");
+
+    let env = TestEnv::new();
+    // The connection stays open, so the capture must find the end of the
+    // message from its chunked framing.
+    let target_port = spawn_http_target_with(response.clone(), true).await;
+    let socket = env.dir.path().join("chunked.sock");
+    let config = env.write_config(
+        "config.toml",
+        &format!(
+            "[[tunnels]]\nname = \"chunked\"\ndomain = \"chunked.example.com\"\nsocket_path = \"{}\"\ntarget_port = {target_port}\n",
+            socket.display()
+        ),
+    );
+    let _core = env.spawn_serve(&config);
+    let info = env.wait_for_info(&config).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || socket.exists().then_some(()))
+            .await
+            .is_some(),
+        "the tunnel socket must be created"
+    );
+
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(b"POST /auth/v1/token?grant_type=password HTTP/1.1\r\nHost: chunked.example.com\r\nAccept-Encoding: gzip, br\r\nContent-Length: 2\r\n\r\n{}")
+        .await
+        .unwrap();
+    let mut reply = vec![0u8; response.len()];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, response, "the response is proxied unchanged");
+
+    let mut mcp = McpHttp::new(&info, read_token(&config));
+    mcp.initialize().await;
+
+    let mut id = 1;
+    let summary = loop {
+        id += 1;
+        let requests = mcp
+            .call_tool(id, "query_requests", json!({ "tunnel_name": "chunked" }))
+            .await;
+        if let Some(first) = requests.as_array().and_then(|r| r.first())
+            && first["status"] == 200
+        {
+            break first.clone();
+        }
+        assert!(id < 100, "the response was never stored: {requests}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let details = mcp
+        .call_tool(id + 1, "get_request", json!({ "id": summary["id"] }))
+        .await;
+    assert_eq!(details["body"], "{}");
+    assert_eq!(
+        details["response"]["body"],
+        std::str::from_utf8(json).unwrap(),
+        "{details}"
+    );
+
+    drop(stream);
+    env.run(&config, &["stop"]).await;
 }

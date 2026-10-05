@@ -6,6 +6,7 @@ mod cloudflare;
 mod cloudflared;
 mod config;
 mod core;
+mod http_body;
 mod instance;
 #[cfg(feature = "mcp")]
 mod mcp;

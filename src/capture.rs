@@ -88,6 +88,8 @@ pub struct CaptureWorker {
     pub websocket_storage: WebSocketMessageStorage,
     log_level: LogLevel,
     log_body_limit: usize,
+    /// Maximum size of a decoded (decompressed) body to store.
+    max_body_size: usize,
     /// Per-connection map from connection_id to the ID of the WebSocket upgrade
     /// request, used to link WS frames back to their HTTP upgrade.
     websocket_upgrades: HashMap<String, String>,
@@ -149,6 +151,14 @@ fn parse_http_headers(lines: &[&str]) -> (HashMap<String, String>, usize) {
     (headers, body_start)
 }
 
+/// Removes chunked transfer coding from `body` when `headers` declare it.
+fn dechunk_if_chunked(headers: &HashMap<String, String>, body: Vec<u8>) -> Vec<u8> {
+    match crate::http_body::header_value(headers, "transfer-encoding") {
+        Some(te) if crate::http_body::is_chunked(te) => crate::http_body::dechunk(&body),
+        _ => body,
+    }
+}
+
 /// Returns `true` if the headers indicate a WebSocket upgrade handshake.
 fn is_websocket_upgrade(headers: &HashMap<String, String>) -> bool {
     headers
@@ -167,11 +177,13 @@ impl Capture {
     ///
     /// * `stdout_level` — parsed by [`LogLevel::from`]; unknown values default to `"basic"`.
     /// * `log_body_limit` — maximum body bytes written to stdout in `full` mode.
+    /// * `max_body_size` — maximum size of a decompressed body to store.
     pub fn new(
         request_storage: RequestStorage,
         websocket_storage: WebSocketMessageStorage,
         stdout_level: &str,
         log_body_limit: usize,
+        max_body_size: usize,
     ) -> (Self, CaptureWorker) {
         let log_level = LogLevel::from(stdout_level);
         let (sender, receiver) = mpsc::channel(CAPTURE_CHANNEL_CAPACITY);
@@ -181,6 +193,7 @@ impl Capture {
             websocket_storage,
             log_level,
             log_body_limit,
+            max_body_size,
             websocket_upgrades: HashMap::new(),
             receiver,
         };
@@ -347,7 +360,12 @@ impl CaptureWorker {
         let path = parts[1].to_string();
 
         let (headers, body_start) = parse_http_headers(lines);
-        let body = extract_body_from_raw(raw_message, body_start < lines.len());
+        // The body keeps its Content-Encoding so that replaying it with the
+        // original headers stays correct.
+        let body = dechunk_if_chunked(
+            &headers,
+            extract_body_from_raw(raw_message, body_start < lines.len()),
+        );
 
         match self.log_level {
             LogLevel::Off => {}
@@ -414,9 +432,19 @@ impl CaptureWorker {
         let Ok(status) = parts[1].parse::<u16>() else {
             return Ok(());
         };
+        if (100..200).contains(&status) && status != 101 {
+            // Interim responses (e.g. 100 Continue) precede the final response
+            // to the same request, which must still be matched to it.
+            return Ok(());
+        }
 
         let (headers, body_start) = parse_http_headers(&lines);
-        let body = extract_body_from_raw(raw_message, body_start < lines.len());
+        let body = dechunk_if_chunked(
+            &headers,
+            extract_body_from_raw(raw_message, body_start < lines.len()),
+        );
+        let body =
+            crate::http_body::decode_response_body_async(&headers, body, self.max_body_size).await;
 
         match self.log_level {
             LogLevel::Off => {}
@@ -565,6 +593,16 @@ impl CaptureWorker {
 }
 
 #[cfg(test)]
+impl Capture {
+    /// A handle whose events are delivered to the returned receiver instead of
+    /// a worker, so tests can inspect exactly what the proxy dispatched.
+    pub fn new_for_testing_channel() -> (Self, mpsc::Receiver<CaptureEvent>) {
+        let (sender, receiver) = mpsc::channel(CAPTURE_CHANNEL_CAPACITY);
+        (Self { sender }, receiver)
+    }
+}
+
+#[cfg(test)]
 impl CaptureWorker {
     /// Constructs a standalone worker for unit tests (no channel sender needed).
     pub fn new_for_testing(
@@ -579,6 +617,7 @@ impl CaptureWorker {
             websocket_storage,
             log_level: LogLevel::from(stdout_level),
             log_body_limit,
+            max_body_size: 1024 * 1024,
             websocket_upgrades: HashMap::new(),
             receiver: rx,
         }
@@ -634,9 +673,10 @@ mod tests {
     fn test_capture_new() {
         let storage = RequestStorage::new(100);
         let websocket_storage = WebSocketMessageStorage::new(1000);
-        let (_handle, worker) = Capture::new(storage, websocket_storage, "full", 1024);
+        let (_handle, worker) = Capture::new(storage, websocket_storage, "full", 1024, 4096);
         assert!(matches!(worker.log_level, LogLevel::Full));
         assert_eq!(worker.log_body_limit, 1024);
+        assert_eq!(worker.max_body_size, 4096);
     }
 
     #[test]
@@ -1440,5 +1480,161 @@ mod connection_tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0].request;
         assert_eq!(request.body, binary_body);
+    }
+}
+
+#[cfg(test)]
+mod body_decoding_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in data.chunks(chunk_size) {
+            out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    fn message(head: &str, body: &[u8]) -> Vec<u8> {
+        let mut raw = head.as_bytes().to_vec();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    /// Captures `request` and then `responses` on one connection and returns
+    /// the resulting exchange.
+    async fn exchange(request: &[u8], responses: &[&[u8]]) -> crate::storage::RequestExchange {
+        let storage = RequestStorage::new(100);
+        let mut worker =
+            CaptureWorker::new_for_testing(storage, WebSocketMessageStorage::new(10), "off", 1024);
+        worker
+            .test_process_http("t", "conn", "→", request)
+            .await
+            .unwrap();
+        for response in responses {
+            worker
+                .test_process_http("t", "conn", "←", response)
+                .await
+                .unwrap();
+        }
+        let mut requests = worker.storage.get_all_requests().await;
+        assert_eq!(requests.len(), 1);
+        requests.remove(0)
+    }
+
+    const TOKEN_REQUEST: &[u8] =
+        b"POST /auth/v1/token?grant_type=password HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    #[tokio::test]
+    async fn chunked_response_body_is_dechunked() {
+        let json = br#"{"access_token":"abc","token_type":"bearer"}"#;
+        let raw = message(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &chunked(json, 10),
+        );
+        let response = exchange(TOKEN_REQUEST, &[&raw]).await.response.unwrap();
+        assert_eq!(response.body, json);
+        assert_eq!(response.raw_response, raw);
+    }
+
+    #[tokio::test]
+    async fn gzip_response_body_is_decompressed() {
+        let json = br#"{"ok":true}"#;
+        let compressed = gzip(json);
+        let raw = message(
+            &format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                compressed.len()
+            ),
+            &compressed,
+        );
+        let response = exchange(TOKEN_REQUEST, &[&raw]).await.response.unwrap();
+        assert_eq!(response.body, json);
+        assert_eq!(response.raw_response, raw, "raw bytes stay as received");
+    }
+
+    #[tokio::test]
+    async fn chunked_gzip_response_body_is_decoded() {
+        let json = br#"{"ok":true,"items":[1,2,3]}"#;
+        let raw = message(
+            "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n",
+            &chunked(&gzip(json), 8),
+        );
+        let response = exchange(TOKEN_REQUEST, &[&raw]).await.response.unwrap();
+        assert_eq!(response.body, json);
+    }
+
+    #[tokio::test]
+    async fn decompressed_body_is_capped_at_max_body_size() {
+        let compressed = gzip(&vec![b'a'; 4 * 1024 * 1024]);
+        let raw = message(
+            &format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                compressed.len()
+            ),
+            &compressed,
+        );
+        let response = exchange(TOKEN_REQUEST, &[&raw]).await.response.unwrap();
+        assert_eq!(response.body.len(), 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn interim_response_does_not_take_the_final_responses_place() {
+        let response = exchange(
+            TOKEN_REQUEST,
+            &[
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            ],
+        )
+        .await
+        .response
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn switching_protocols_is_stored_as_the_response() {
+        let upgrade = b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let response = exchange(upgrade, &[b"HTTP/1.1 101 Switching Protocols\r\n\r\n"])
+            .await
+            .response
+            .unwrap();
+        assert_eq!(response.status, 101);
+    }
+
+    #[tokio::test]
+    async fn chunked_request_body_is_dechunked() {
+        let raw = message(
+            "POST /upload HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &chunked(b"hello world", 4),
+        );
+        let request = exchange(&raw, &[]).await.request;
+        assert_eq!(request.body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn compressed_request_body_is_kept_for_replay() {
+        let compressed = gzip(b"payload");
+        let raw = message(
+            &format!(
+                "POST /upload HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                compressed.len()
+            ),
+            &compressed,
+        );
+        let request = exchange(&raw, &[]).await.request;
+        assert_eq!(request.body, compressed);
     }
 }

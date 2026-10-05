@@ -443,10 +443,10 @@ impl AppService {
             };
         }
 
-        let target_port = {
+        let (target_port, max_body_size) = {
             let cfg = self.config.read().await;
             match cfg.tunnels.iter().find(|t| t.name == req.tunnel_name) {
-                Some(t) => t.target_port,
+                Some(t) => (t.target_port, cfg.capture.max_request_body_size),
                 None => err!(format!("Tunnel '{}' not found", req.tunnel_name)),
             }
         };
@@ -508,6 +508,9 @@ impl AppService {
             Ok(b) => b.to_vec(),
             Err(e) => err!(format!("Failed to read response body: {e}")),
         };
+        let resp_body =
+            crate::http_body::decode_response_body_async(&resp_headers, resp_body, max_body_size)
+                .await;
 
         // Build the stored exchange with replayed = true.
         let id = uuid::Uuid::new_v4().to_string();
@@ -771,6 +774,60 @@ mod tests {
             *service.subscribe_connector().borrow(),
             ConnectorState::Connected
         );
+    }
+
+    #[tokio::test]
+    async fn replayed_compressed_response_is_stored_decoded() {
+        use std::io::Write as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(b"{\"replayed\":true}").unwrap();
+        let compressed = gzip.finish().unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&compressed);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream.write_all(&response).await.unwrap();
+            let _ = stream.shutdown().await;
+        });
+
+        let service = make_service(false);
+        service.config.write().await.tunnels.push(TunnelConfig {
+            name: "api".into(),
+            domain: "api.example.com".into(),
+            socket_path: "/tmp/unused.sock".into(),
+            target_port,
+            enabled: true,
+        });
+
+        let result = service
+            .replay_request(ReplayRequestPayload {
+                tunnel_name: "api".into(),
+                method: "GET".into(),
+                url: "/".into(),
+                headers: [("Accept-Encoding".to_string(), "gzip".to_string())].into(),
+                body: String::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.error, None);
+
+        let exchange = service
+            .request_storage
+            .get_request_by_id(&result.id.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(exchange.response.unwrap().body, b"{\"replayed\":true}");
     }
 
     #[tokio::test]

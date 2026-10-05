@@ -39,6 +39,8 @@ wry = { version = "0.55", optional = true }
 tao = { version = "0.35", optional = true }
 winresource = "0.1.31"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+flate2 = "1"
+brotli-decompressor = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -47,6 +49,7 @@ libc = "0.2"
 tempfile = "3.0"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.0", features = ["test-util"] }
+brotli = "8"
 
 [profile.dev]
 opt-level = 0
