@@ -1,3 +1,4 @@
+use crate::http_body::BodyDecoder;
 use crate::storage::{
     RequestStorage, StoredRequest, StoredResponse, StoredWebSocketMessage, WebSocketMessageStorage,
     WebSocketMessageType,
@@ -57,6 +58,16 @@ pub enum CaptureEvent {
         direction: String,
         raw_frame: Vec<u8>,
     },
+    /// The head of a response whose body is captured while it streams in.
+    HttpStreamStart {
+        tunnel_name: String,
+        connection_id: String,
+        raw_head: Vec<u8>,
+    },
+    /// Further raw body bytes of the streaming response on `connection_id`.
+    HttpStreamData { connection_id: String, raw: Vec<u8> },
+    /// The streaming response on `connection_id` has ended.
+    HttpStreamEnd { connection_id: String },
 }
 
 /// Capacity of the bounded channel between the proxy hot-path and the capture
@@ -93,7 +104,15 @@ pub struct CaptureWorker {
     /// Per-connection map from connection_id to the ID of the WebSocket upgrade
     /// request, used to link WS frames back to their HTTP upgrade.
     websocket_upgrades: HashMap<String, String>,
+    /// Responses whose body is still streaming in, by connection.
+    streams: HashMap<String, ResponseStream>,
     receiver: mpsc::Receiver<CaptureEvent>,
+}
+
+/// A streaming response being captured.
+struct ResponseStream {
+    request_id: String,
+    decoder: BodyDecoder,
 }
 
 /// HTTP method tokens to identify request lines.
@@ -151,6 +170,11 @@ fn parse_http_headers(lines: &[&str]) -> (HashMap<String, String>, usize) {
     (headers, body_start)
 }
 
+/// Parses the status code from a response's status line.
+fn parse_status(lines: &[&str]) -> Option<u16> {
+    lines.first()?.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Removes chunked transfer coding from `body` when `headers` declare it.
 fn dechunk_if_chunked(headers: &HashMap<String, String>, body: Vec<u8>) -> Vec<u8> {
     match crate::http_body::header_value(headers, "transfer-encoding") {
@@ -195,6 +219,7 @@ impl Capture {
             log_body_limit,
             max_body_size,
             websocket_upgrades: HashMap::new(),
+            streams: HashMap::new(),
             receiver,
         };
         (handle, worker)
@@ -211,20 +236,15 @@ impl Capture {
         direction: String,
         raw: Vec<u8>,
     ) {
-        match self.sender.try_send(CaptureEvent::HttpMessage {
-            tunnel_name,
-            connection_id,
-            direction,
-            raw,
-        }) {
-            Ok(_) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("Capture channel full – dropping HTTP message");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!("Capture channel closed – dropping HTTP message");
-            }
-        }
+        self.enqueue(
+            CaptureEvent::HttpMessage {
+                tunnel_name,
+                connection_id,
+                direction,
+                raw,
+            },
+            "HTTP message",
+        );
     }
 
     /// Enqueues a raw WebSocket frame for background capture.
@@ -237,18 +257,62 @@ impl Capture {
         direction: String,
         raw_frame: Vec<u8>,
     ) {
-        match self.sender.try_send(CaptureEvent::WebSocketFrame {
-            tunnel_name,
-            connection_id,
-            direction,
-            raw_frame,
-        }) {
-            Ok(_) => {}
+        self.enqueue(
+            CaptureEvent::WebSocketFrame {
+                tunnel_name,
+                connection_id,
+                direction,
+                raw_frame,
+            },
+            "WebSocket frame",
+        );
+    }
+
+    /// Enqueues the head of a streaming response.  Returns `false` when the
+    /// event was dropped.
+    pub fn enqueue_stream_start(
+        &self,
+        tunnel_name: String,
+        connection_id: String,
+        raw_head: Vec<u8>,
+    ) -> bool {
+        self.enqueue(
+            CaptureEvent::HttpStreamStart {
+                tunnel_name,
+                connection_id,
+                raw_head,
+            },
+            "streaming response",
+        )
+    }
+
+    /// Enqueues body bytes of a streaming response.  Returns `false` when the
+    /// event was dropped.
+    pub fn enqueue_stream_data(&self, connection_id: String, raw: Vec<u8>) -> bool {
+        self.enqueue(
+            CaptureEvent::HttpStreamData { connection_id, raw },
+            "streaming response data",
+        )
+    }
+
+    /// Enqueues the end of a streaming response.
+    pub fn enqueue_stream_end(&self, connection_id: String) {
+        self.enqueue(
+            CaptureEvent::HttpStreamEnd { connection_id },
+            "streaming response end",
+        );
+    }
+
+    fn enqueue(&self, event: CaptureEvent, what: &str) -> bool {
+        match self.sender.try_send(event) {
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("Capture channel full – dropping WebSocket frame");
+                warn!("Capture channel full – dropping {what}");
+                false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                warn!("Capture channel closed – dropping WebSocket frame");
+                warn!("Capture channel closed – dropping {what}");
+                false
             }
         }
     }
@@ -275,38 +339,51 @@ impl CaptureWorker {
     /// Call this inside a `tokio::spawn` or similar before creating connections.
     pub async fn run(mut self) {
         while let Some(event) = self.receiver.recv().await {
-            match event {
-                CaptureEvent::HttpMessage {
-                    tunnel_name,
-                    connection_id,
-                    direction,
-                    raw,
-                } => {
-                    if let Err(e) = self
-                        .process_http_message(&tunnel_name, &connection_id, &direction, &raw)
-                        .await
-                    {
-                        warn!("Failed to capture HTTP message: {}", e);
-                    }
+            self.process_event(event).await;
+        }
+    }
+
+    async fn process_event(&mut self, event: CaptureEvent) {
+        match event {
+            CaptureEvent::HttpMessage {
+                tunnel_name,
+                connection_id,
+                direction,
+                raw,
+            } => {
+                if let Err(e) = self
+                    .process_http_message(&tunnel_name, &connection_id, &direction, &raw)
+                    .await
+                {
+                    warn!("Failed to capture HTTP message: {}", e);
                 }
-                CaptureEvent::WebSocketFrame {
-                    tunnel_name,
-                    connection_id,
-                    direction,
-                    raw_frame,
-                } => {
-                    if let Err(e) = self
-                        .process_websocket_frame(
-                            &tunnel_name,
-                            &connection_id,
-                            &direction,
-                            &raw_frame,
-                        )
-                        .await
-                    {
-                        warn!("Failed to capture WebSocket frame: {}", e);
-                    }
+            }
+            CaptureEvent::WebSocketFrame {
+                tunnel_name,
+                connection_id,
+                direction,
+                raw_frame,
+            } => {
+                if let Err(e) = self
+                    .process_websocket_frame(&tunnel_name, &connection_id, &direction, &raw_frame)
+                    .await
+                {
+                    warn!("Failed to capture WebSocket frame: {}", e);
                 }
+            }
+            CaptureEvent::HttpStreamStart {
+                tunnel_name,
+                connection_id,
+                raw_head,
+            } => {
+                self.start_stream(&tunnel_name, &connection_id, raw_head)
+                    .await;
+            }
+            CaptureEvent::HttpStreamData { connection_id, raw } => {
+                self.continue_stream(&connection_id, &raw).await;
+            }
+            CaptureEvent::HttpStreamEnd { connection_id } => {
+                self.end_stream(&connection_id).await;
             }
         }
     }
@@ -425,11 +502,7 @@ impl CaptureWorker {
     ) -> anyhow::Result<()> {
         let message_str = String::from_utf8_lossy(raw_message);
         let lines: Vec<&str> = message_str.lines().collect();
-        let parts: Vec<&str> = lines[0].split_whitespace().collect();
-        if parts.len() < 2 {
-            return Ok(());
-        }
-        let Ok(status) = parts[1].parse::<u16>() else {
+        let Some(status) = parse_status(&lines) else {
             return Ok(());
         };
         if (100..200).contains(&status) && status != 101 {
@@ -446,30 +519,85 @@ impl CaptureWorker {
         let body =
             crate::http_body::decode_response_body_async(&headers, body, self.max_body_size).await;
 
-        match self.log_level {
-            LogLevel::Off => {}
-            LogLevel::Basic => {
-                info!("← {} [{}]", status, tunnel_name);
-            }
-            LogLevel::Full => {
-                info!(
-                    "[{}] ← {} - {} bytes",
-                    tunnel_name,
-                    status,
-                    raw_message.len()
-                );
-                info!("[{}] Headers: {:?}", tunnel_name, headers);
-                info!(
-                    "[{}] Body: {}",
-                    tunnel_name,
-                    Capture::body_preview_pub(&body, self.log_body_limit)
-                );
-            }
-        }
+        self.log_response(tunnel_name, status, &headers, raw_message.len(), &body);
+        let (request_id, response_time_ms) = self.match_pending_request(connection_id).await;
+        self.storage
+            .store_response(StoredResponse {
+                request_id,
+                timestamp: chrono::Utc::now(),
+                status,
+                headers,
+                body,
+                raw_response: raw_message.to_vec(),
+                response_time_ms,
+                streaming: false,
+            })
+            .await;
+        Ok(())
+    }
 
+    /// Stores the head of a streaming response, whose body is appended by
+    /// [`continue_stream`](Self::continue_stream) as it arrives.
+    async fn start_stream(&mut self, tunnel_name: &str, connection_id: &str, raw_head: Vec<u8>) {
+        // A response whose end event was dropped is complete by now.
+        self.end_stream(connection_id).await;
+
+        let message_str = String::from_utf8_lossy(&raw_head);
+        let lines: Vec<&str> = message_str.lines().collect();
+        let Some(status) = parse_status(&lines) else {
+            return;
+        };
+        let (headers, _) = parse_http_headers(&lines);
+        self.log_response(tunnel_name, status, &headers, raw_head.len(), b"");
+
+        let (request_id, response_time_ms) = self.match_pending_request(connection_id).await;
+        let decoder = BodyDecoder::new(&headers, self.max_body_size);
+        self.storage
+            .store_response(StoredResponse {
+                request_id: request_id.clone(),
+                timestamp: chrono::Utc::now(),
+                status,
+                headers,
+                body: Vec::new(),
+                raw_response: raw_head,
+                response_time_ms,
+                streaming: true,
+            })
+            .await;
+        self.streams.insert(
+            connection_id.to_string(),
+            ResponseStream {
+                request_id,
+                decoder,
+            },
+        );
+    }
+
+    async fn continue_stream(&mut self, connection_id: &str, raw: &[u8]) {
+        let Some(stream) = self.streams.get_mut(connection_id) else {
+            return;
+        };
+        let decoded = stream.decoder.push(raw);
+        self.storage
+            .append_response_body(&stream.request_id, &decoded, raw)
+            .await;
+    }
+
+    async fn end_stream(&mut self, connection_id: &str) {
+        let Some(mut stream) = self.streams.remove(connection_id) else {
+            return;
+        };
+        let decoded = stream.decoder.finish();
+        self.storage
+            .finish_response(&stream.request_id, &decoded)
+            .await;
+    }
+
+    /// Dequeues the request a response on `connection_id` answers, returning
+    /// its ID (`"unknown"` when unmatched) and the elapsed time in milliseconds.
+    async fn match_pending_request(&self, connection_id: &str) -> (String, Option<f64>) {
         let now = chrono::Utc::now();
-        let (request_id, response_time_ms) = self
-            .storage
+        self.storage
             .get_next_pending_request_for_connection(connection_id)
             .await
             .map(|(id, request_time)| {
@@ -477,20 +605,32 @@ impl CaptureWorker {
                 let ms = elapsed.num_microseconds().unwrap_or(0) as f64 / 1000.0;
                 (id, Some(ms))
             })
-            .unwrap_or_else(|| ("unknown".to_string(), None));
+            .unwrap_or_else(|| ("unknown".to_string(), None))
+    }
 
-        let stored_response = StoredResponse {
-            request_id,
-            timestamp: now,
-            status,
-            headers,
-            body,
-            raw_response: raw_message.to_vec(),
-            response_time_ms,
-        };
-
-        self.storage.store_response(stored_response).await;
-        Ok(())
+    fn log_response(
+        &self,
+        tunnel_name: &str,
+        status: u16,
+        headers: &HashMap<String, String>,
+        raw_len: usize,
+        body: &[u8],
+    ) {
+        match self.log_level {
+            LogLevel::Off => {}
+            LogLevel::Basic => {
+                info!("← {} [{}]", status, tunnel_name);
+            }
+            LogLevel::Full => {
+                info!("[{}] ← {} - {} bytes", tunnel_name, status, raw_len);
+                info!("[{}] Headers: {:?}", tunnel_name, headers);
+                info!(
+                    "[{}] Body: {}",
+                    tunnel_name,
+                    Capture::body_preview_pub(body, self.log_body_limit)
+                );
+            }
+        }
     }
 
     /// Parses a raw WebSocket frame, unmasks the payload if necessary, and
@@ -619,6 +759,7 @@ impl CaptureWorker {
             log_body_limit,
             max_body_size: 1024 * 1024,
             websocket_upgrades: HashMap::new(),
+            streams: HashMap::new(),
             receiver: rx,
         }
     }
@@ -643,6 +784,10 @@ impl CaptureWorker {
     ) -> anyhow::Result<()> {
         self.process_websocket_frame(tunnel_name, connection_id, direction, raw_frame)
             .await
+    }
+
+    pub async fn test_process_event(&mut self, event: CaptureEvent) {
+        self.process_event(event).await;
     }
 }
 
@@ -1636,5 +1781,220 @@ mod body_decoding_tests {
         );
         let request = exchange(&raw, &[]).await.request;
         assert_eq!(request.body, compressed);
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::storage::RequestUpdate;
+    use std::io::Write as _;
+
+    const SSE_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    fn worker() -> CaptureWorker {
+        CaptureWorker::new_for_testing(
+            RequestStorage::new(100),
+            WebSocketMessageStorage::new(10),
+            "full",
+            1024,
+        )
+    }
+
+    async fn send_request(worker: &mut CaptureWorker, path: &str) -> String {
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+        worker
+            .test_process_http("t", "conn", "→", raw.as_bytes())
+            .await
+            .unwrap();
+        worker.storage.get_all_requests().await[0]
+            .request
+            .id
+            .clone()
+    }
+
+    fn start(head: &[u8]) -> CaptureEvent {
+        CaptureEvent::HttpStreamStart {
+            tunnel_name: "t".to_string(),
+            connection_id: "conn".to_string(),
+            raw_head: head.to_vec(),
+        }
+    }
+
+    fn data(raw: &[u8]) -> CaptureEvent {
+        CaptureEvent::HttpStreamData {
+            connection_id: "conn".to_string(),
+            raw: raw.to_vec(),
+        }
+    }
+
+    fn end() -> CaptureEvent {
+        CaptureEvent::HttpStreamEnd {
+            connection_id: "conn".to_string(),
+        }
+    }
+
+    async fn response(worker: &CaptureWorker, id: &str) -> StoredResponse {
+        worker
+            .storage
+            .get_request_by_id(id)
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_is_stored_as_it_arrives() {
+        let mut worker = worker();
+        let id = send_request(&mut worker, "/events").await;
+
+        worker.test_process_event(start(SSE_HEAD)).await;
+        let stored = response(&worker, &id).await;
+        assert!(stored.streaming);
+        assert_eq!(stored.status, 200);
+        assert_eq!(stored.headers["Content-Type"], "text/event-stream");
+        assert!(stored.body.is_empty());
+
+        worker
+            .test_process_event(data(b"b\r\ndata: one\n\n\r\n"))
+            .await;
+        assert_eq!(response(&worker, &id).await.body, b"data: one\n\n");
+
+        worker
+            .test_process_event(data(b"b\r\ndata: two\n\n\r\n0\r\n\r\n"))
+            .await;
+        worker.test_process_event(end()).await;
+        let stored = response(&worker, &id).await;
+        assert!(!stored.streaming);
+        assert_eq!(stored.body, b"data: one\n\ndata: two\n\n");
+        assert_eq!(
+            stored.raw_response,
+            [
+                SSE_HEAD,
+                b"b\r\ndata: one\n\n\r\nb\r\ndata: two\n\n\r\n0\r\n\r\n"
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_updates_are_broadcast() {
+        let mut worker = worker();
+        let id = send_request(&mut worker, "/events").await;
+        let mut updates = worker.storage.subscribe_requests();
+
+        worker.test_process_event(start(SSE_HEAD)).await;
+        worker
+            .test_process_event(data(b"b\r\ndata: one\n\n\r\n"))
+            .await;
+        worker.test_process_event(end()).await;
+
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(RequestUpdate::Exchange(e)) if e.response.as_ref().is_some_and(|r| r.streaming)
+        ));
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(RequestUpdate::ResponseBodyAppended { request_id, offset: 0, data, .. })
+                if request_id == id && data == b"data: one\n\n"
+        ));
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(RequestUpdate::Exchange(e))
+                if e.response.as_ref().is_some_and(|r| !r.streaming && r.body == b"data: one\n\n")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compressed_stream_is_decoded_incrementally() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"data: one\n\n").unwrap();
+        encoder.flush().unwrap();
+        let first = encoder.get_ref().len();
+        encoder.write_all(b"data: two\n\n").unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        let mut worker = worker();
+        let id = send_request(&mut worker, "/events").await;
+        worker
+            .test_process_event(start(
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n",
+            ))
+            .await;
+        worker.test_process_event(data(&gzipped[..first])).await;
+        assert_eq!(response(&worker, &id).await.body, b"data: one\n\n");
+        worker.test_process_event(data(&gzipped[first..])).await;
+        worker.test_process_event(end()).await;
+        assert_eq!(
+            response(&worker, &id).await.body,
+            b"data: one\n\ndata: two\n\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_stream_finishes_one_whose_end_was_lost() {
+        let mut worker = worker();
+        let first = send_request(&mut worker, "/first").await;
+        worker.test_process_event(start(SSE_HEAD)).await;
+        worker
+            .test_process_event(data(b"b\r\ndata: one\n\n\r\n0\r\n\r\n"))
+            .await;
+
+        worker
+            .test_process_http("t", "conn", "→", b"GET /second HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        worker.test_process_event(start(SSE_HEAD)).await;
+
+        assert!(!response(&worker, &first).await.streaming);
+        let requests = worker.storage.get_all_requests().await;
+        let second = requests
+            .iter()
+            .find(|e| e.request.url == "/second")
+            .unwrap();
+        assert!(second.response.as_ref().unwrap().streaming);
+    }
+
+    #[tokio::test]
+    async fn events_without_stream_are_ignored() {
+        let mut worker = worker();
+        let id = send_request(&mut worker, "/plain").await;
+        worker.test_process_event(data(b"stray")).await;
+        worker.test_process_event(end()).await;
+        worker.test_process_event(start(b"garbage\r\n\r\n")).await;
+        assert!(
+            worker
+                .storage
+                .get_request_by_id(&id)
+                .await
+                .unwrap()
+                .response
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_messages_are_processed_as_events() {
+        let mut worker = worker();
+        worker
+            .test_process_event(CaptureEvent::HttpMessage {
+                tunnel_name: "t".to_string(),
+                connection_id: "conn".to_string(),
+                direction: "→".to_string(),
+                raw: b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+            })
+            .await;
+        worker
+            .test_process_event(CaptureEvent::HttpMessage {
+                tunnel_name: "t".to_string(),
+                connection_id: "conn".to_string(),
+                direction: "←".to_string(),
+                raw: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            })
+            .await;
+        let requests = worker.storage.get_all_requests().await;
+        assert_eq!(requests[0].response.as_ref().unwrap().body, b"ok");
     }
 }

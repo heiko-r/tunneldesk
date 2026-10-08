@@ -40,6 +40,17 @@ describe("mapToTunneledRequest", () => {
     expect(result.responseTime).toBe(123);
     expect(result.responseHeaders).toEqual({ "Content-Length": "42" });
     expect(result.responseBody).toBe("cmVzcG9uc2U=");
+    expect(result.streaming).toBe(false);
+  });
+
+  it("maps the streaming flag of a response", () => {
+    const result = mapToTunneledRequest(baseRequest, {
+      status: 200,
+      headers: {},
+      body: "",
+      streaming: true,
+    });
+    expect(result.streaming).toBe(true);
   });
 
   it("leaves optional response fields undefined when no response given", () => {

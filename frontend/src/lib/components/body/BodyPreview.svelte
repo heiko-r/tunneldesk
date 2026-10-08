@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import { decodeBase64, bytesToHex, bytesToUtf, formatJson, formatXml } from "$lib/utils";
   import Select from "$lib/components/Select.svelte";
 
@@ -14,18 +15,33 @@
   let {
     body,
     mimeType,
+    live = false,
   }: {
     body: string;
     mimeType?: string;
+    /** The body is still growing: keep the end in view while scrolled to the bottom. */
+    live?: boolean;
   } = $props();
 
   type ViewType = "preview" | "json" | "xml" | "utf" | "hex" | "base64";
 
-  let selectedView: ViewType = $derived(autoSelectView(mimeType));
+  /*
+   * Intermediate deriveds only propagate actual changes, so a user-selected
+   * view survives updates of a streaming body.
+   */
+  let mime = $derived(mimeType);
+  let sniffedView: ViewType = $derived(mime ? "utf" : sniffView(body));
+  let selectedView: ViewType = $derived(autoSelectView(mime, sniffedView));
+
+  function sniffView(base64: string): ViewType {
+    const start = bytesToUtf(decodeBase64(base64.slice(0, 256))).trim();
+    if (start.startsWith("{") || start.startsWith("[")) return "json";
+    if (start.startsWith("<")) return "xml";
+    return "utf";
+  }
 
   /** Derives the best default view based on MIME type or body content. */
-  function autoSelectView(mime: string | undefined): ViewType {
-    const decoded = bytesToUtf(decodeBase64(body));
+  function autoSelectView(mime: string | undefined, sniffed: ViewType): ViewType {
     if (mime) {
       if (mime.includes("json")) return "json";
       if (mime.includes("xml")) return "xml";
@@ -33,9 +49,7 @@
       if (mime.includes("text/")) return "utf";
       return "preview";
     }
-    if (decoded.trim().startsWith("{") || decoded.trim().startsWith("[")) return "json";
-    if (decoded.trim().startsWith("<")) return "xml";
-    return "utf";
+    return sniffed;
   }
 
   let content = $derived.by(() => {
@@ -67,6 +81,20 @@
   function isHtmlMime(): boolean {
     return mimeType?.includes("text/html") ?? false;
   }
+
+  let scroller: HTMLElement | undefined = $state();
+  let followed: HTMLElement | undefined;
+
+  $effect.pre(() => {
+    const el = scroller;
+    void content;
+    if (!el || !live) return;
+    const atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    if (el !== followed || atEnd) {
+      followed = el;
+      tick().then(() => el.scrollTo(0, el.scrollHeight));
+    }
+  });
 </script>
 
 {#if content}
@@ -89,10 +117,10 @@
             title="HTML preview"
           ></iframe>
         {:else}
-          <pre class="code-block">{bytesToUtf(decodeBase64(content))}</pre>
+          <pre class="code-block" bind:this={scroller}>{bytesToUtf(decodeBase64(content))}</pre>
         {/if}
       {:else}
-        <pre class="code-block">{content}</pre>
+        <pre class="code-block" data-testid="body-content" bind:this={scroller}>{content}</pre>
       {/if}
     </div>
   </div>

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterAll, beforeAll, describe, it, expect } from "vitest";
 import { render } from "vitest-browser-svelte";
 import { page } from "vitest/browser";
 import BodyPreview from "./BodyPreview.svelte";
@@ -67,5 +67,69 @@ describe("BodyPreview", () => {
   it("auto-detects JSON from content when no mime type provided", async () => {
     render(BodyPreview, { props: { body: b64('{"auto":true}') } });
     await expect.element(page.getByRole("button", { name: /formatted json/i })).toBeInTheDocument();
+  });
+
+  it("keeps the selected view while a streaming body grows", async () => {
+    const screen = render(BodyPreview, {
+      props: { body: b64("data: 1\n\n"), mimeType: "text/event-stream", live: true },
+    });
+    await page.getByRole("button", { name: /raw utf-8/i }).click();
+    await page.getByRole("option", { name: "Raw Hex" }).click();
+
+    await screen.rerender({ body: b64("data: 1\n\ndata: 2\n\n") });
+    await expect.element(page.getByRole("button", { name: /raw hex/i })).toBeInTheDocument();
+    await expect.element(page.getByTestId("body-content")).toHaveTextContent(/32 0a 0a$/);
+  });
+
+  it("keeps the selected view while a body without mime type grows", async () => {
+    const screen = render(BodyPreview, { props: { body: b64('{"a":'), live: true } });
+    await expect.element(page.getByRole("button", { name: /formatted json/i })).toBeInTheDocument();
+    await page.getByRole("button", { name: /formatted json/i }).click();
+    await page.getByRole("option", { name: "Raw UTF-8" }).click();
+
+    await screen.rerender({ body: b64('{"a":1}') });
+    await expect.element(page.getByRole("button", { name: /raw utf-8/i })).toBeInTheDocument();
+    await expect.element(page.getByTestId("body-content")).toHaveTextContent('{"a":1}');
+  });
+
+  describe("live bodies", () => {
+    // The global stylesheet, which limits the code block height, is not loaded here.
+    const style = document.createElement("style");
+    style.textContent = ".code-block { max-height: 100px; overflow-y: auto; }";
+    beforeAll(() => document.head.append(style));
+    afterAll(() => style.remove());
+
+    const lines = (n: number) => b64(Array.from({ length: n }, (_, i) => `data: ${i}\n`).join(""));
+    const scroller = () => document.querySelector("pre.code-block") as HTMLElement;
+    const atEnd = (el: HTMLElement) => el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+
+    it("start scrolled to the end and follow new data", async () => {
+      const screen = render(BodyPreview, {
+        props: { body: lines(100), mimeType: "text/plain", live: true },
+      });
+      await expect.poll(() => scroller().scrollTop).toBeGreaterThan(0);
+      expect(atEnd(scroller())).toBe(true);
+
+      await screen.rerender({ body: lines(200) });
+      await expect.poll(() => atEnd(scroller())).toBe(true);
+    });
+
+    it("stop following once scrolled away from the end", async () => {
+      const screen = render(BodyPreview, {
+        props: { body: lines(100), mimeType: "text/plain", live: true },
+      });
+      await expect.poll(() => scroller().scrollTop).toBeGreaterThan(0);
+      scroller().scrollTop = 0;
+
+      await screen.rerender({ body: lines(200) });
+      await expect.element(page.getByTestId("body-content")).toHaveTextContent(/data: 199/);
+      expect(scroller().scrollTop).toBe(0);
+    });
+
+    it("are not scrolled when complete", async () => {
+      render(BodyPreview, { props: { body: lines(100), mimeType: "text/plain" } });
+      await expect.element(page.getByTestId("body-content")).toHaveTextContent(/data: 99/);
+      expect(scroller().scrollTop).toBe(0);
+    });
   });
 });

@@ -31,6 +31,8 @@ export type TunneledRequest = {
   responseHeaders?: { [key: string]: string };
   requestBody: string | null;
   responseBody?: string;
+  /** `true` while the response body is still arriving (e.g. server-sent events). */
+  streaming?: boolean;
   isWebSocket?: boolean;
   /** `true` when this request was created by the replay feature. */
   replayed?: boolean;

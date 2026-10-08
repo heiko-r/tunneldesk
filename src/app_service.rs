@@ -50,6 +50,8 @@ pub struct StoredResponseWithBase64 {
     /// Base64-encoded raw response bytes.
     pub raw_response: String,
     pub response_time_ms: Option<f64>,
+    /// `true` while the body is still arriving.
+    pub streaming: bool,
 }
 
 /// A [`StoredWebSocketMessage`](crate::storage::StoredWebSocketMessage) with
@@ -536,6 +538,7 @@ impl AppService {
             body: resp_body,
             raw_response: vec![],
             response_time_ms: Some(elapsed),
+            streaming: false,
         };
 
         let exchange = crate::storage::RequestExchange {
@@ -626,6 +629,7 @@ pub fn response_to_base64(response: &crate::storage::StoredResponse) -> StoredRe
         body: base64::engine::general_purpose::STANDARD.encode(&response.body),
         raw_response: base64::engine::general_purpose::STANDARD.encode(&response.raw_response),
         response_time_ms: response.response_time_ms,
+        streaming: response.streaming,
     }
 }
 

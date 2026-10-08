@@ -1,11 +1,15 @@
 //! Decoding of captured HTTP/1.1 bodies for display: chunked transfer coding
 //! and `Content-Encoding` (gzip, deflate, br).
 //!
-//! All functions are tolerant of truncated input, because captured bodies are
-//! cut off at the configured size limit.
+//! Bodies can be decoded in one go or incrementally as they stream in, and
+//! decoding is tolerant of truncated input, because captured bodies are cut
+//! off at the configured size limit.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{self, Write};
+
+use brotli_decompressor::DecompressorWriter;
+use flate2::write::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 
 /// Case-insensitive header lookup.
 pub fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -24,31 +28,109 @@ pub fn is_chunked(transfer_encoding: &str) -> bool {
         .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"))
 }
 
+/// Incremental parser for `Transfer-Encoding: chunked` framing, fed with the
+/// body bytes as they arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkedFraming {
+    /// Reading a chunk-size line.  `in_ext` is set once a non-hex byte (the
+    /// start of a chunk extension) was seen; the rest of the line is ignored.
+    Size {
+        size: usize,
+        in_ext: bool,
+    },
+    Data {
+        remaining: usize,
+    },
+    /// Skipping the line break after chunk data.
+    DataEnd,
+    /// Reading the trailer section after the last chunk, which ends with an
+    /// empty line.
+    Trailer {
+        line_len: usize,
+    },
+}
+
+impl ChunkedFraming {
+    pub const START: Self = Self::Size {
+        size: 0,
+        in_ext: false,
+    };
+
+    /// Consumes `data`.  Returns `Some(n)` when the message ends after the
+    /// first `n` bytes, or `None` when all of `data` belongs to the message.
+    pub fn advance(&mut self, data: &[u8]) -> Option<usize> {
+        self.advance_with(data, |_| {})
+    }
+
+    /// Like [`advance`](Self::advance), passing the chunk data to `on_data`.
+    pub fn advance_with(&mut self, data: &[u8], mut on_data: impl FnMut(&[u8])) -> Option<usize> {
+        let mut i = 0;
+        while i < data.len() {
+            match *self {
+                Self::Data { remaining } => {
+                    let take = remaining.min(data.len() - i);
+                    on_data(&data[i..i + take]);
+                    i += take;
+                    *self = if take == remaining {
+                        Self::DataEnd
+                    } else {
+                        Self::Data {
+                            remaining: remaining - take,
+                        }
+                    };
+                }
+                Self::Size { size, in_ext } => {
+                    let byte = data[i];
+                    i += 1;
+                    *self = match byte {
+                        b'\n' if size == 0 => Self::Trailer { line_len: 0 },
+                        b'\n' => Self::Data { remaining: size },
+                        b'\r' => continue,
+                        _ if in_ext => continue,
+                        _ => match (byte as char).to_digit(16) {
+                            Some(digit) => Self::Size {
+                                size: size.saturating_mul(16).saturating_add(digit as usize),
+                                in_ext,
+                            },
+                            None => Self::Size { size, in_ext: true },
+                        },
+                    };
+                }
+                Self::DataEnd => {
+                    if data[i] == b'\n' {
+                        *self = Self::START;
+                    }
+                    i += 1;
+                }
+                Self::Trailer { line_len } => {
+                    let byte = data[i];
+                    i += 1;
+                    match byte {
+                        b'\n' if line_len == 0 => {
+                            *self = Self::START;
+                            return Some(i);
+                        }
+                        b'\n' => *self = Self::Trailer { line_len: 0 },
+                        b'\r' => {}
+                        _ => {
+                            *self = Self::Trailer {
+                                line_len: line_len + 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Removes chunked transfer coding framing, returning the concatenated chunk
 /// data. A truncated final chunk contributes the bytes that are present.
-pub fn dechunk(mut data: &[u8]) -> Vec<u8> {
+pub fn dechunk(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    while let Some(line_end) = data.iter().position(|&b| b == b'\n') {
-        let size_line = String::from_utf8_lossy(&data[..line_end]);
-        let size_str = size_line.split(';').next().unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_str, 16) else {
-            break;
-        };
-        if size == 0 {
-            break;
-        }
-        data = &data[line_end + 1..];
-        let take = size.min(data.len());
-        out.extend_from_slice(&data[..take]);
-        data = &data[take..];
-        if take < size {
-            break;
-        }
-        data = data
-            .strip_prefix(b"\r\n")
-            .or_else(|| data.strip_prefix(b"\n"))
-            .unwrap_or(data);
-    }
+    let mut framing = ChunkedFraming::START;
+    framing.advance_with(data, |chunk| out.extend_from_slice(chunk));
     out
 }
 
@@ -62,12 +144,18 @@ pub fn decode_response_body(
     body: Vec<u8>,
     limit: usize,
 ) -> Vec<u8> {
-    match header_value(headers, "content-encoding") {
-        Some(encoding) if !body.is_empty() => {
-            decode_content_encoding(encoding, &body, limit).unwrap_or(body)
-        }
-        _ => body,
+    let stages = content_stages(headers);
+    if stages.is_empty() || body.is_empty() {
+        return body;
     }
+    let mut decoder = BodyDecoder {
+        chunked: None,
+        stages,
+        remaining: limit,
+    };
+    let mut decoded = decoder.push(&body);
+    decoded.extend(decoder.finish());
+    decoded
 }
 
 /// [`decode_response_body`] on the blocking thread pool, since decompressing a
@@ -77,7 +165,7 @@ pub async fn decode_response_body_async(
     body: Vec<u8>,
     limit: usize,
 ) -> Vec<u8> {
-    if !has_content_encoding(headers) {
+    if content_stages(headers).is_empty() {
         return body;
     }
     let headers = headers.clone();
@@ -86,51 +174,215 @@ pub async fn decode_response_body_async(
         .unwrap_or_default()
 }
 
-/// Returns `true` when `headers` declare a `Content-Encoding` other than identity.
-fn has_content_encoding(headers: &HashMap<String, String>) -> bool {
-    header_value(headers, "content-encoding").is_some_and(|encoding| {
-        encoding
-            .split(',')
-            .any(|c| !c.trim().is_empty() && !c.trim().eq_ignore_ascii_case("identity"))
-    })
+/// Decodes a response body incrementally as its raw bytes arrive: removes
+/// chunked framing and undoes the `Content-Encoding`, producing at most
+/// `limit` bytes in total.
+pub struct BodyDecoder {
+    chunked: Option<ChunkedFraming>,
+    /// Decoders for the content codings, in the order they must be undone.
+    stages: Vec<ContentStage>,
+    /// Output bytes left before reaching the limit.
+    remaining: usize,
 }
 
-/// Decodes a body with the comma-separated codings in `encoding`, which were
-/// applied in order, so they are undone in reverse.
-fn decode_content_encoding(encoding: &str, body: &[u8], limit: usize) -> Option<Vec<u8>> {
-    let mut data = body.to_vec();
-    for coding in encoding.rsplit(',').map(str::trim) {
-        data = match coding.to_ascii_lowercase().as_str() {
-            "" | "identity" => continue,
-            "gzip" | "x-gzip" => read_lossy(flate2::read::MultiGzDecoder::new(&data[..]), limit)?,
-            // `deflate` is zlib-wrapped by spec, but some servers send raw deflate.
-            "deflate" => read_lossy(flate2::read::ZlibDecoder::new(&data[..]), limit)
-                .or_else(|| read_lossy(flate2::read::DeflateDecoder::new(&data[..]), limit))?,
-            "br" => read_lossy(
-                brotli_decompressor::Decompressor::new(&data[..], 4096),
-                limit,
-            )?,
-            _ => return None,
-        };
-    }
-    Some(data)
-}
-
-/// Reads up to `limit` bytes, keeping what was decoded before an error (such as
-/// the unexpected end of a truncated stream). Returns `None` when nothing could
-/// be decoded.
-fn read_lossy(reader: impl Read, limit: usize) -> Option<Vec<u8>> {
-    let mut reader = reader.take(limit as u64);
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => return Some(out),
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return (!out.is_empty()).then_some(out),
+impl BodyDecoder {
+    pub fn new(headers: &HashMap<String, String>, limit: usize) -> Self {
+        Self {
+            chunked: header_value(headers, "transfer-encoding")
+                .is_some_and(is_chunked)
+                .then_some(ChunkedFraming::START),
+            stages: content_stages(headers),
+            remaining: limit,
         }
     }
+
+    /// Decodes the next raw body bytes, returning the newly decoded bytes.
+    pub fn push(&mut self, raw: &[u8]) -> Vec<u8> {
+        if self.remaining == 0 {
+            return Vec::new();
+        }
+        let mut data = match &mut self.chunked {
+            Some(framing) => {
+                let mut out = Vec::with_capacity(raw.len());
+                framing.advance_with(raw, |chunk| out.extend_from_slice(chunk));
+                out
+            }
+            None => raw.to_vec(),
+        };
+        for stage in &mut self.stages {
+            if data.is_empty() {
+                break;
+            }
+            data = stage.push(&data);
+        }
+        self.within_limit(data)
+    }
+
+    /// Returns the output still held by the decoders at the end of the body.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let mut data = Vec::new();
+        for stage in &mut self.stages {
+            let mut out = if data.is_empty() {
+                Vec::new()
+            } else {
+                stage.push(&data)
+            };
+            out.extend(stage.finish());
+            data = out;
+        }
+        self.within_limit(data)
+    }
+
+    fn within_limit(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+        data.truncate(self.remaining);
+        self.remaining -= data.len();
+        data
+    }
+}
+
+/// Decoders for the comma-separated `Content-Encoding` codings, which were
+/// applied in order and are therefore undone in reverse.  Empty when there is
+/// nothing to decode, or when a coding is unsupported (the body is then kept
+/// as-is).
+fn content_stages(headers: &HashMap<String, String>) -> Vec<ContentStage> {
+    let Some(encoding) = header_value(headers, "content-encoding") else {
+        return Vec::new();
+    };
+    let mut stages = Vec::new();
+    for coding in encoding.rsplit(',').map(str::trim) {
+        if coding.is_empty() || coding.eq_ignore_ascii_case("identity") {
+            continue;
+        }
+        let Some(decoder) = ContentDecoder::for_coding(coding) else {
+            return Vec::new();
+        };
+        stages.push(ContentStage {
+            decoder,
+            undecoded: Some(Vec::new()),
+        });
+    }
+    stages
+}
+
+/// One content coding being undone.
+struct ContentStage {
+    decoder: ContentDecoder,
+    /// Input kept until the decoder produces output, so that data which turns
+    /// out not to be encoded after all can be passed through as-is.
+    undecoded: Option<Vec<u8>>,
+}
+
+impl ContentStage {
+    fn push(&mut self, input: &[u8]) -> Vec<u8> {
+        if let Some(undecoded) = &mut self.undecoded {
+            undecoded.extend_from_slice(input);
+        }
+        let result = self.decoder.write(input);
+        self.settle(result)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let result = self.decoder.finish();
+        self.settle(result)
+    }
+
+    fn settle(&mut self, result: io::Result<Vec<u8>>) -> Vec<u8> {
+        match result {
+            Ok(out) => {
+                if !out.is_empty() {
+                    self.undecoded = None;
+                }
+                out
+            }
+            Err(_) => match self.undecoded.take() {
+                Some(raw) => {
+                    self.decoder = ContentDecoder::Passthrough;
+                    raw
+                }
+                None => {
+                    self.decoder = ContentDecoder::Failed;
+                    Vec::new()
+                }
+            },
+        }
+    }
+}
+
+enum ContentDecoder {
+    Gzip(MultiGzDecoder<Vec<u8>>),
+    Zlib(ZlibDecoder<Vec<u8>>),
+    RawDeflate(DeflateDecoder<Vec<u8>>),
+    /// `deflate` before its first two bytes, which tell zlib-wrapped data
+    /// (as the spec requires) from raw deflate (as some servers send), arrived.
+    Deflate(Vec<u8>),
+    Brotli(Box<DecompressorWriter<Vec<u8>>>),
+    /// The data turned out not to be encoded and is passed through.
+    Passthrough,
+    /// Decoding failed after producing output; the rest is dropped.
+    Failed,
+}
+
+impl ContentDecoder {
+    fn for_coding(coding: &str) -> Option<Self> {
+        Some(match coding.to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => Self::Gzip(MultiGzDecoder::new(Vec::new())),
+            "deflate" => Self::Deflate(Vec::new()),
+            "br" => Self::Brotli(Box::new(DecompressorWriter::new(Vec::new(), 4096))),
+            _ => return None,
+        })
+    }
+
+    /// Feeds `input` and returns the output it produced.
+    fn write(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Gzip(d) => write_and_take(d, input, MultiGzDecoder::get_mut),
+            Self::Zlib(d) => write_and_take(d, input, ZlibDecoder::get_mut),
+            Self::RawDeflate(d) => write_and_take(d, input, DeflateDecoder::get_mut),
+            Self::Brotli(d) => write_and_take(&mut **d, input, DecompressorWriter::get_mut),
+            Self::Deflate(head) => {
+                head.extend_from_slice(input);
+                if head.len() < 2 {
+                    return Ok(Vec::new());
+                }
+                let head = std::mem::take(head);
+                // RFC 1950: compression method 8, and the 16-bit header is a
+                // multiple of 31.
+                let zlib = head[0] & 0x0f == 8 && u16::from_be_bytes([head[0], head[1]]) % 31 == 0;
+                *self = if zlib {
+                    Self::Zlib(ZlibDecoder::new(Vec::new()))
+                } else {
+                    Self::RawDeflate(DeflateDecoder::new(Vec::new()))
+                };
+                self.write(&head)
+            }
+            Self::Passthrough => Ok(input.to_vec()),
+            Self::Failed => Ok(Vec::new()),
+        }
+    }
+
+    /// Ends the stream and returns the remaining output.
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Gzip(d) => d.try_finish().map(|()| std::mem::take(d.get_mut())),
+            Self::Zlib(d) => d.try_finish().map(|()| std::mem::take(d.get_mut())),
+            Self::RawDeflate(d) => d.try_finish().map(|()| std::mem::take(d.get_mut())),
+            Self::Brotli(d) => d.close().map(|()| std::mem::take(d.get_mut())),
+            Self::Deflate(_) => Err(io::ErrorKind::UnexpectedEof.into()),
+            Self::Passthrough | Self::Failed => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Writes `input` to a decoder, flushes it, and takes the output collected in
+/// its inner buffer.
+fn write_and_take<D: Write>(
+    decoder: &mut D,
+    input: &[u8],
+    inner: fn(&mut D) -> &mut Vec<u8>,
+) -> io::Result<Vec<u8>> {
+    decoder.write_all(input)?;
+    decoder.flush()?;
+    Ok(std::mem::take(inner(decoder)))
 }
 
 #[cfg(test)]
@@ -341,18 +593,177 @@ mod tests {
         assert_eq!(decoded, vec![b'a'; 1000]);
     }
 
-    // ── has_content_encoding ──────────────────────────────────────────────
+    // ── content_stages ────────────────────────────────────────────────────
 
     #[test]
-    fn has_content_encoding_detects_real_codings() {
-        assert!(has_content_encoding(&headers(&[(
-            "Content-Encoding",
-            "br"
-        )])));
-        assert!(!has_content_encoding(&headers(&[(
-            "Content-Encoding",
-            "identity"
-        )])));
-        assert!(!has_content_encoding(&headers(&[])));
+    fn content_stages_skip_identity_and_unknown_codings() {
+        assert_eq!(
+            content_stages(&headers(&[("Content-Encoding", "br")])).len(),
+            1
+        );
+        assert_eq!(
+            content_stages(&headers(&[("Content-Encoding", "gzip, br")])).len(),
+            2
+        );
+        assert!(content_stages(&headers(&[("Content-Encoding", "identity")])).is_empty());
+        assert!(content_stages(&headers(&[("Content-Encoding", "gzip, zstd")])).is_empty());
+        assert!(content_stages(&headers(&[])).is_empty());
+    }
+
+    // ── ChunkedFraming ────────────────────────────────────────────────────
+
+    #[test]
+    fn chunked_framing_finds_message_end() {
+        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT";
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(body), Some(body.len() - 4));
+        assert_eq!(framing, ChunkedFraming::START);
+    }
+
+    #[test]
+    fn chunked_framing_byte_by_byte() {
+        let body = b"a;ext=1\r\n0123456789\r\n0\r\nTrailer: x\r\n\r\n";
+        let mut framing = ChunkedFraming::START;
+        let mut data = Vec::new();
+        for (i, byte) in body.iter().enumerate() {
+            let result =
+                framing.advance_with(std::slice::from_ref(byte), |d| data.extend_from_slice(d));
+            if i == body.len() - 1 {
+                assert_eq!(result, Some(1));
+            } else {
+                assert_eq!(result, None, "byte {i}");
+            }
+        }
+        assert_eq!(data, b"0123456789");
+    }
+
+    #[test]
+    fn chunked_framing_chunk_data_resembling_terminator() {
+        // Chunk data containing "0\r\n\r\n" must not end the message.
+        let body = b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(body), Some(body.len()));
+    }
+
+    #[test]
+    fn chunked_framing_incomplete() {
+        let mut framing = ChunkedFraming::START;
+        assert_eq!(framing.advance(b"10\r\nonly part"), None);
+        assert_eq!(framing, ChunkedFraming::Data { remaining: 7 });
+    }
+
+    // ── BodyDecoder (incremental) ─────────────────────────────────────────
+
+    fn chunked(data: &[u8], chunk_size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in data.chunks(chunk_size) {
+            out.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    /// Feeds `raw` to a decoder in pieces of `piece` bytes and returns the
+    /// output of each push, plus the output of `finish`.
+    fn decode_in_pieces(h: &HashMap<String, String>, raw: &[u8], piece: usize) -> Vec<Vec<u8>> {
+        let mut decoder = BodyDecoder::new(h, usize::MAX);
+        let mut outputs: Vec<Vec<u8>> = raw.chunks(piece).map(|p| decoder.push(p)).collect();
+        outputs.push(decoder.finish());
+        outputs
+    }
+
+    #[test]
+    fn body_decoder_dechunks_incrementally() {
+        let h = headers(&[("Transfer-Encoding", "chunked")]);
+        let raw = chunked(b"data: one\n\ndata: two\n\n", 11);
+        for piece in [1, 5, 64] {
+            let outputs = decode_in_pieces(&h, &raw, piece);
+            assert_eq!(
+                outputs.concat(),
+                b"data: one\n\ndata: two\n\n",
+                "piece {piece}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_decoder_emits_events_as_they_arrive() {
+        let h = headers(&[("Transfer-Encoding", "chunked")]);
+        let mut decoder = BodyDecoder::new(&h, usize::MAX);
+        assert_eq!(decoder.push(b"b\r\ndata: one\n\n\r\n"), b"data: one\n\n");
+        assert_eq!(decoder.push(b"b\r\ndata: two\n\n\r\n"), b"data: two\n\n");
+        assert_eq!(decoder.push(b"0\r\n\r\n"), b"");
+        assert_eq!(decoder.finish(), b"");
+    }
+
+    #[test]
+    fn body_decoder_passes_identity_bodies_through() {
+        let mut decoder = BodyDecoder::new(&headers(&[]), usize::MAX);
+        assert_eq!(decoder.push(b"until close"), b"until close");
+        assert_eq!(decoder.finish(), b"");
+    }
+
+    /// Compresses `parts` as one stream, flushing after each, so every part
+    /// can be decoded as soon as it arrives (as streaming servers do).
+    fn gzip_flushed(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut pieces = Vec::new();
+        for part in parts {
+            enc.write_all(part).unwrap();
+            enc.flush().unwrap();
+            pieces.push(std::mem::take(enc.get_mut()));
+        }
+        pieces.push(enc.finish().unwrap());
+        pieces
+    }
+
+    #[test]
+    fn body_decoder_decompresses_gzip_streams_incrementally() {
+        let h = headers(&[("Content-Encoding", "gzip")]);
+        let pieces = gzip_flushed(&[b"data: one\n\n", b"data: two\n\n"]);
+        let mut decoder = BodyDecoder::new(&h, usize::MAX);
+        assert_eq!(decoder.push(&pieces[0]), b"data: one\n\n");
+        assert_eq!(decoder.push(&pieces[1]), b"data: two\n\n");
+        let mut tail = decoder.push(&pieces[2]);
+        tail.extend(decoder.finish());
+        assert_eq!(tail, b"");
+    }
+
+    #[test]
+    fn body_decoder_decompresses_chunked_brotli_byte_by_byte() {
+        let h = headers(&[("Content-Encoding", "br"), ("Transfer-Encoding", "chunked")]);
+        let text = b"{\"streamed\":\"brotli\"}".repeat(20);
+        let outputs = decode_in_pieces(&h, &chunked(&brotli(&text), 7), 1);
+        assert_eq!(outputs.concat(), text);
+    }
+
+    #[test]
+    fn body_decoder_detects_zlib_and_raw_deflate_across_pushes() {
+        let h = headers(&[("Content-Encoding", "deflate")]);
+        assert_eq!(decode_in_pieces(&h, &zlib(b"zlib"), 1).concat(), b"zlib");
+        assert_eq!(
+            decode_in_pieces(&h, &raw_deflate(b"raw"), 1).concat(),
+            b"raw"
+        );
+    }
+
+    #[test]
+    fn body_decoder_passes_undecodable_data_through() {
+        let h = headers(&[("Content-Encoding", "gzip")]);
+        assert_eq!(
+            decode_in_pieces(&h, b"plain text", 3).concat(),
+            b"plain text"
+        );
+    }
+
+    #[test]
+    fn body_decoder_respects_the_limit() {
+        let h = headers(&[("Transfer-Encoding", "chunked")]);
+        let mut decoder = BodyDecoder::new(&h, 5);
+        assert_eq!(decoder.push(b"3\r\nabc\r\n"), b"abc");
+        assert_eq!(decoder.push(b"3\r\ndef\r\n"), b"de");
+        assert_eq!(decoder.push(b"3\r\nghi\r\n"), b"");
     }
 }

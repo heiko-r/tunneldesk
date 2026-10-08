@@ -61,6 +61,8 @@
       <span class="col-url url-cell">
         {#if req.isWebSocket}<span class="ws-badge">WS</span>{/if}
         {#if req.replayed}<span class="replay-badge">↩</span>{/if}
+        {#if req.streaming}<span class="live-badge" title="Response still streaming">LIVE</span
+          >{/if}
         {req.url}
       </span>
       <span class="col-status"

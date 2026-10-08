@@ -72,6 +72,8 @@
     <span>{fmtTime(request.timestamp)}</span>
     <span>{fmtMs(request.responseTime)}</span>
     {#if isWebsocket(request)}<span class="ws-badge">WebSocket</span>{/if}
+    {#if request.streaming}<span class="live-badge" title="Response still streaming">LIVE</span
+      >{/if}
   </div>
 
   <div class="detail-tabs">
@@ -108,7 +110,10 @@
           mimeType={request.responseHeaders
             ? getHeaderValue(request.responseHeaders, "content-type")
             : undefined}
+          live={request.streaming}
         />
+      {:else if request.streaming}
+        <div class="empty-state">Waiting for the response body…</div>
       {:else}
         <div class="empty-state">No response body.</div>
       {/if}

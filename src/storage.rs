@@ -46,6 +46,24 @@ pub struct StoredResponse {
     /// Round-trip time from when the request was stored until this response was
     /// received, in milliseconds.  `None` when the request could not be matched.
     pub response_time_ms: Option<f64>,
+    /// `true` while the body is still arriving (e.g. server-sent events).
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+/// A change to the stored exchanges, as delivered to subscribers.
+#[derive(Debug, Clone)]
+pub enum RequestUpdate {
+    /// An exchange whose response was stored or finished streaming.
+    Exchange(Box<RequestExchange>),
+    /// `data` was appended to the body of a streaming response at byte
+    /// `offset`.
+    ResponseBodyAppended {
+        tunnel_name: String,
+        request_id: String,
+        offset: usize,
+        data: Vec<u8>,
+    },
 }
 
 /// A paired HTTP request and its optional response.
@@ -329,7 +347,7 @@ pub struct RequestStorage {
     requests: Arc<RwLock<HashMap<String, RequestExchange>>>,
     pending_requests_per_connection: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
     max_requests: usize,
-    request_sender: broadcast::Sender<RequestExchange>,
+    request_sender: broadcast::Sender<RequestUpdate>,
 }
 
 impl RequestStorage {
@@ -428,25 +446,70 @@ impl RequestStorage {
             requests.insert(id, exchange.clone());
         }
 
-        let _ = self.request_sender.send(exchange);
+        let _ = self
+            .request_sender
+            .send(RequestUpdate::Exchange(Box::new(exchange)));
     }
 
     /// Attaches `response` to its corresponding request exchange and broadcasts
-    /// the completed exchange to all active subscribers.  Does nothing when no
-    /// exchange with `response.request_id` exists.
+    /// the exchange to all active subscribers.  Does nothing when no exchange
+    /// with `response.request_id` exists.
     pub async fn store_response(&self, response: StoredResponse) {
         let mut requests = self.requests.write().await;
 
         if let Some(exchange) = requests.get_mut(&response.request_id) {
-            exchange.response = Some(response.clone());
-
-            // Broadcast the complete exchange when response is stored
-            let _ = self.request_sender.send(exchange.clone());
+            exchange.response = Some(response);
+            let _ = self
+                .request_sender
+                .send(RequestUpdate::Exchange(Box::new(exchange.clone())));
         }
     }
 
+    /// Appends decoded body bytes (and the raw bytes they were decoded from)
+    /// to a streaming response, broadcasting the decoded bytes.  Does nothing
+    /// unless the response exists and is streaming.
+    pub async fn append_response_body(&self, request_id: &str, decoded: &[u8], raw: &[u8]) {
+        let mut requests = self.requests.write().await;
+        let Some(exchange) = requests.get_mut(request_id) else {
+            return;
+        };
+        let Some(response) = exchange.response.as_mut().filter(|r| r.streaming) else {
+            return;
+        };
+        response.raw_response.extend_from_slice(raw);
+        if decoded.is_empty() {
+            return;
+        }
+        let offset = response.body.len();
+        response.body.extend_from_slice(decoded);
+        let _ = self
+            .request_sender
+            .send(RequestUpdate::ResponseBodyAppended {
+                tunnel_name: exchange.request.tunnel_name.clone(),
+                request_id: request_id.to_string(),
+                offset,
+                data: decoded.to_vec(),
+            });
+    }
+
+    /// Appends the final decoded bytes to a streaming response, marks it
+    /// complete and broadcasts the whole exchange.
+    pub async fn finish_response(&self, request_id: &str, decoded: &[u8]) {
+        let mut requests = self.requests.write().await;
+        let Some(exchange) = requests.get_mut(request_id) else {
+            return;
+        };
+        let Some(response) = exchange.response.as_mut().filter(|r| r.streaming) else {
+            return;
+        };
+        response.body.extend_from_slice(decoded);
+        response.streaming = false;
+        let _ = self
+            .request_sender
+            .send(RequestUpdate::Exchange(Box::new(exchange.clone())));
+    }
+
     /// Returns the [`RequestExchange`] with the given `id`, or `None` if not found.
-    #[cfg(any(feature = "mcp", test))]
     pub async fn get_request_by_id(&self, id: &str) -> Option<RequestExchange> {
         let requests = self.requests.read().await;
         requests.get(id).cloned()
@@ -513,9 +576,9 @@ impl RequestStorage {
         requests.len()
     }
 
-    /// Returns a broadcast receiver that delivers each completed exchange (i.e.,
-    /// one where a response has been stored).
-    pub fn subscribe_requests(&self) -> broadcast::Receiver<RequestExchange> {
+    /// Returns a broadcast receiver that delivers each exchange whose response
+    /// was stored or finished streaming, and the growth of streaming bodies.
+    pub fn subscribe_requests(&self) -> broadcast::Receiver<RequestUpdate> {
         self.request_sender.subscribe()
     }
 }
@@ -549,7 +612,113 @@ mod tests {
             body: vec![],
             raw_response: vec![],
             response_time_ms: None,
+            streaming: false,
         }
+    }
+
+    async fn storage_with_streaming_response() -> RequestStorage {
+        let storage = RequestStorage::new(100);
+        storage
+            .store_request(create_test_request("s1", "t", "GET", "/events"))
+            .await;
+        storage
+            .store_response(StoredResponse {
+                streaming: true,
+                raw_response: b"HEAD".to_vec(),
+                ..create_test_response("s1", 200)
+            })
+            .await;
+        storage
+    }
+
+    async fn stored_response(storage: &RequestStorage, id: &str) -> StoredResponse {
+        storage
+            .get_request_by_id(id)
+            .await
+            .unwrap()
+            .response
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_append_response_body_extends_and_broadcasts() {
+        let storage = storage_with_streaming_response().await;
+        let mut updates = storage.subscribe_requests();
+
+        storage.append_response_body("s1", b"one", b"raw1").await;
+        storage.append_response_body("s1", b"", b"raw2").await;
+        storage.append_response_body("s1", b"two", b"raw3").await;
+
+        let response = stored_response(&storage, "s1").await;
+        assert_eq!(response.body, b"onetwo");
+        assert_eq!(response.raw_response, b"HEADraw1raw2raw3");
+        assert!(response.streaming);
+        for (expected_offset, expected_data) in [(0, b"one"), (3, b"two")] {
+            match updates.try_recv().unwrap() {
+                RequestUpdate::ResponseBodyAppended {
+                    tunnel_name,
+                    request_id,
+                    offset,
+                    data,
+                } => {
+                    assert_eq!(tunnel_name, "t");
+                    assert_eq!(request_id, "s1");
+                    assert_eq!(offset, expected_offset);
+                    assert_eq!(data, expected_data);
+                }
+                other => panic!("unexpected update {other:?}"),
+            }
+        }
+        assert!(
+            updates.try_recv().is_err(),
+            "empty appends are not broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finish_response_completes_and_broadcasts() {
+        let storage = storage_with_streaming_response().await;
+        let mut updates = storage.subscribe_requests();
+        storage.append_response_body("s1", b"one", b"").await;
+        storage.finish_response("s1", b"!").await;
+
+        let response = stored_response(&storage, "s1").await;
+        assert_eq!(response.body, b"one!");
+        assert!(!response.streaming);
+        let _appended = updates.try_recv().unwrap();
+        assert!(matches!(
+            updates.try_recv().unwrap(),
+            RequestUpdate::Exchange(e) if e.response.as_ref().unwrap().body == b"one!"
+        ));
+
+        // A finished response no longer accepts body bytes.
+        storage.append_response_body("s1", b"late", b"late").await;
+        storage.finish_response("s1", b"late").await;
+        assert_eq!(stored_response(&storage, "s1").await.body, b"one!");
+        assert!(updates.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stream_updates_for_unknown_requests_are_ignored() {
+        let storage = RequestStorage::new(100);
+        storage
+            .store_request(create_test_request("r1", "t", "GET", "/"))
+            .await;
+        let mut updates = storage.subscribe_requests();
+        storage.append_response_body("missing", b"x", b"x").await;
+        storage.finish_response("missing", b"x").await;
+        // A request without a response has nothing to append to.
+        storage.append_response_body("r1", b"x", b"x").await;
+        storage.finish_response("r1", b"x").await;
+        assert!(
+            storage
+                .get_request_by_id("r1")
+                .await
+                .unwrap()
+                .response
+                .is_none()
+        );
+        assert!(updates.try_recv().is_err());
     }
 
     #[tokio::test]

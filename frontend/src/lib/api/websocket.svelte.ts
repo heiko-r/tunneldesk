@@ -1,17 +1,19 @@
 import {
   getActiveQueryFilter,
-  addRequests,
   addTunnel,
+  appendResponseBody,
   addWsMessage,
   cloudflareStatus,
   coreStatus,
   lastReplayedId,
   lastSyncReport,
   removeTunnel,
+  replaceRequest,
   setWsMessages,
   updateRequests,
   updateTunnel,
   updateTunnels,
+  upsertRequest,
 } from "$lib/stores.svelte";
 import { mapToTunnel, mapToTunneledRequest, decodeWsPayload, parseWsDirection } from "./mappers";
 import type { RawTunnel } from "./mappers";
@@ -51,6 +53,7 @@ type RawResponseData = {
   response_time_ms?: number;
   body: string;
   raw_response: string;
+  streaming?: boolean;
 };
 
 type WsMessageData = {
@@ -73,6 +76,14 @@ type RequestsResponse = {
 type NewRequestResponse = {
   type: "NewRequest";
   data: { request: RawRequestData; response?: RawResponseData };
+};
+type RequestResponse = {
+  type: "Request";
+  data: { request: RawRequestData; response?: RawResponseData };
+};
+type ResponseBodyAppendedResponse = {
+  type: "ResponseBodyAppended";
+  data: { request_id: string; tunnel_name: string; offset: number; data: string };
 };
 type WebSocketMessagesResponse = { type: "WebSocketMessages"; data: WsMessageData[] };
 type NewWebSocketMessageResponse = { type: "NewWebSocketMessage"; data: WsMessageData };
@@ -166,6 +177,12 @@ function connect() {
         case "NewRequest":
           handleNewRequestMessage(message as NewRequestResponse);
           break;
+        case "Request":
+          handleRequestMessage(message as RequestResponse);
+          break;
+        case "ResponseBodyAppended":
+          handleResponseBodyAppendedMessage(message as ResponseBodyAppendedResponse);
+          break;
         case "WebSocketMessages":
           handleWebSocketMessagesMessage(message as WebSocketMessagesResponse);
           break;
@@ -256,7 +273,19 @@ function handleNewRequestMessage(message: NewRequestResponse) {
       if ("Class" in f.status && Math.floor(s / 100) !== f.status.Class) return;
     }
   }
-  addRequests(request.tunnel_name, [mapToTunneledRequest(request, response)]);
+  upsertRequest(request.tunnel_name, mapToTunneledRequest(request, response));
+}
+
+function handleRequestMessage(message: RequestResponse) {
+  const { request, response } = message.data;
+  replaceRequest(request.tunnel_name, mapToTunneledRequest(request, response));
+}
+
+function handleResponseBodyAppendedMessage(message: ResponseBodyAppendedResponse) {
+  const { request_id, tunnel_name, offset, data } = message.data;
+  if (appendResponseBody(tunnel_name, request_id, offset, data) === "gap") {
+    getRequest(request_id);
+  }
 }
 
 function handleWebSocketMessagesMessage(message: WebSocketMessagesResponse) {
@@ -374,6 +403,11 @@ export function queryRequests(
     sort_direction: sortDirection,
   };
   send({ type: "QueryRequests", data });
+}
+
+/** Fetches a single stored exchange, e.g. to resync a streaming body. */
+export function getRequest(requestId: string) {
+  send({ type: "GetRequest", data: requestId });
 }
 
 /** Requests stored WebSocket messages for a given upgraded HTTP request. */

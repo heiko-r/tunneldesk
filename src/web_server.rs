@@ -10,6 +10,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine as _;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use crate::app_service::{
 };
 use crate::core::ClientRegistry;
 use crate::security::{Decision, HEALTH_PATH, LOGIN_PAGE, SecurityPolicy};
-use crate::storage::{QueryFilter, RequestExchange, WebSocketMessageFilter};
+use crate::storage::{QueryFilter, RequestExchange, RequestUpdate, WebSocketMessageFilter};
 
 /// Commands sent by the browser over the GUI WebSocket connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,8 @@ pub enum WebSocketMessage {
     ListTunnels,
     QueryRequests(QueryFilter),
     QueryWebSocketMessages(WebSocketMessageFilter),
+    /// Fetches one exchange by request ID, e.g. to resync a streaming body.
+    GetRequest(String),
     Subscribe(QueryFilter),
     Unsubscribe,
     // --- Tunnel CRUD ---
@@ -65,8 +68,13 @@ pub enum WebSocketResponse {
     Tunnels(Vec<TunnelInfo>),
     Requests(Vec<RequestExchangeWithBase64>),
     WebSocketMessages(Vec<StoredWebSocketMessageWithBase64>),
-    /// Push notification for a newly completed request–response exchange.
+    /// A single exchange, answering [`WebSocketMessage::GetRequest`].
+    Request(Box<RequestExchangeWithBase64>),
+    /// Push notification for an exchange whose response was stored or
+    /// finished streaming.
     NewRequest(Box<RequestExchangeWithBase64>),
+    /// Push notification for body bytes appended to a streaming response.
+    ResponseBodyAppended(ResponseBodyAppended),
     /// Push notification for a newly stored WebSocket frame.
     NewWebSocketMessage(Box<StoredWebSocketMessageWithBase64>),
     // --- CRUD responses (also pushed to every client on change) ---
@@ -84,6 +92,16 @@ pub enum WebSocketResponse {
     CoreStatus(CoreStatusResponse),
     ShuttingDown,
     Error(String),
+}
+
+/// Body bytes appended to a streaming response.  `data` (base64) continues the
+/// body at byte `offset`; clients holding a shorter body have missed data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseBodyAppended {
+    pub request_id: String,
+    pub tunnel_name: String,
+    pub offset: usize,
+    pub data: String,
 }
 
 impl From<TunnelEvent> for WebSocketResponse {
@@ -183,6 +201,34 @@ impl ConnectionState {
     fn accepts(&self, exchange: &RequestExchange) -> bool {
         self.filter.as_ref().is_none_or(|f| f.matches(exchange))
     }
+
+    /// Converts a storage update into the push notification for this
+    /// connection, if it is subscribed to it.  Body appends are filtered by
+    /// tunnel only; clients ignore appends for requests they do not show.
+    fn notification(&self, update: &RequestUpdate) -> Option<WebSocketResponse> {
+        match update {
+            RequestUpdate::Exchange(exchange) => self
+                .accepts(exchange)
+                .then(|| WebSocketResponse::NewRequest(Box::new(exchange_to_base64(exchange)))),
+            RequestUpdate::ResponseBodyAppended {
+                tunnel_name,
+                request_id,
+                offset,
+                data,
+            } => self
+                .filter
+                .as_ref()
+                .is_none_or(|f| f.tunnel_name.as_ref().is_none_or(|t| t == tunnel_name))
+                .then(|| {
+                    WebSocketResponse::ResponseBodyAppended(ResponseBodyAppended {
+                        request_id: request_id.clone(),
+                        tunnel_name: tunnel_name.clone(),
+                        offset: *offset,
+                        data: base64::engine::general_purpose::STANDARD.encode(data),
+                    })
+                }),
+        }
+    }
 }
 
 /// Serves the static web UI, the GUI WebSocket, the control API and MCP.
@@ -276,6 +322,7 @@ impl WebServer {
             WebSocketMessage::QueryWebSocketMessages(filter) => {
                 self.handle_query_websocket_messages(&filter).await
             }
+            WebSocketMessage::GetRequest(id) => self.handle_get_request(&id).await,
             WebSocketMessage::Subscribe(filter) => {
                 conn.filter = Some(filter);
                 WebSocketResponse::Requests(vec![])
@@ -326,6 +373,13 @@ impl WebServer {
         let requests_with_base64: Vec<RequestExchangeWithBase64> =
             requests.iter().map(exchange_to_base64).collect();
         WebSocketResponse::Requests(requests_with_base64)
+    }
+
+    async fn handle_get_request(&self, id: &str) -> WebSocketResponse {
+        match self.app_service.request_storage.get_request_by_id(id).await {
+            Some(exchange) => WebSocketResponse::Request(Box::new(exchange_to_base64(&exchange))),
+            None => WebSocketResponse::Error(format!("Request {id} not found")),
+        }
     }
 
     async fn handle_query_websocket_messages(
@@ -515,9 +569,7 @@ async fn websocket_connection(mut socket: WebSocket, server: Arc<WebServer>) {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => None,
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
             },
-            Ok(exchange) = request_receiver.recv() => conn
-                .accepts(&exchange)
-                .then(|| WebSocketResponse::NewRequest(Box::new(exchange_to_base64(&exchange)))),
+            Ok(update) = request_receiver.recv() => conn.notification(&update),
             Ok(ws_msg) = ws_message_receiver.recv() => Some(
                 WebSocketResponse::NewWebSocketMessage(Box::new(websocket_message_to_base64(&ws_msg)))
             ),
@@ -554,7 +606,6 @@ mod tests {
         WebSocketMessageStorage, WebSocketMessageType,
     };
     use crate::tunnel::TunnelManager;
-    use base64::Engine as _;
     use std::collections::HashMap;
     use tokio::sync::RwLock;
 
@@ -627,6 +678,7 @@ mod tests {
             body: b"response body".to_vec(),
             raw_response: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
             response_time_ms: Some(42.0),
+            streaming: false,
         }
     }
 
@@ -1391,7 +1443,7 @@ mod tests {
 mod server_tests {
     use super::*;
     use crate::config::Config;
-    use crate::storage::{RequestStorage, StoredRequest, WebSocketMessageStorage};
+    use crate::storage::{RequestStorage, StoredRequest, StoredResponse, WebSocketMessageStorage};
     use crate::tunnel::TunnelManager;
     use axum::body::Body;
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -1537,6 +1589,132 @@ mod server_tests {
         assert!(matches!(got, Some(WebSocketResponse::NewRequest(e)) if e.request.id == "req-a"));
         let leaked = next_matching(&mut b, |r| matches!(r, WebSocketResponse::NewRequest(_))).await;
         assert!(leaked.is_none(), "client B must not see tunnel-a requests");
+    }
+
+    async fn subscribe(ws: &mut Ws, tunnel: &str) {
+        send(
+            ws,
+            &WebSocketMessage::Subscribe(QueryFilter {
+                tunnel_name: Some(tunnel.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        next_matching(ws, |r| matches!(r, WebSocketResponse::Requests(_)))
+            .await
+            .expect("subscribe acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn streaming_bodies_are_pushed_to_subscribers_of_their_tunnel() {
+        let server = start_server().await;
+        let mut a = connect(server.port).await;
+        let mut b = connect(server.port).await;
+        subscribe(&mut a, "tunnel-a").await;
+        subscribe(&mut b, "tunnel-b").await;
+
+        let storage = &server.app.request_storage;
+        storage.store_exchange(exchange("sse", "tunnel-a")).await;
+        storage
+            .store_response(StoredResponse {
+                request_id: "sse".to_string(),
+                timestamp: chrono::Utc::now(),
+                status: 200,
+                headers: Default::default(),
+                body: vec![],
+                raw_response: vec![],
+                response_time_ms: None,
+                streaming: true,
+            })
+            .await;
+        let started = next_matching(
+            &mut a,
+            |r| matches!(r, WebSocketResponse::NewRequest(e) if e.response.is_some()),
+        )
+        .await;
+        assert!(matches!(
+            started,
+            Some(WebSocketResponse::NewRequest(e)) if e.response.as_ref().is_some_and(|r| r.streaming)
+        ));
+
+        storage
+            .append_response_body("sse", b"data: 1\n\n", b"")
+            .await;
+        let appended = next_matching(&mut a, |r| {
+            matches!(r, WebSocketResponse::ResponseBodyAppended(_))
+        })
+        .await;
+        match appended {
+            Some(WebSocketResponse::ResponseBodyAppended(update)) => {
+                assert_eq!(update.request_id, "sse");
+                assert_eq!(update.tunnel_name, "tunnel-a");
+                assert_eq!(update.offset, 0);
+                assert_eq!(update.data, "ZGF0YTogMQoK");
+            }
+            other => panic!("expected a body append, got {other:?}"),
+        }
+
+        storage.finish_response("sse", b"").await;
+        let finished =
+            next_matching(&mut a, |r| matches!(r, WebSocketResponse::NewRequest(_))).await;
+        assert!(matches!(
+            finished,
+            Some(WebSocketResponse::NewRequest(e)) if e.response.as_ref().is_some_and(|r| !r.streaming)
+        ));
+
+        let leaked = next_matching(&mut b, |r| {
+            matches!(
+                r,
+                WebSocketResponse::NewRequest(_) | WebSocketResponse::ResponseBodyAppended(_)
+            )
+        })
+        .await;
+        assert!(leaked.is_none(), "client B must not see tunnel-a updates");
+    }
+
+    #[test]
+    fn body_appends_reach_unfiltered_connections() {
+        let update = RequestUpdate::ResponseBodyAppended {
+            tunnel_name: "t".to_string(),
+            request_id: "r".to_string(),
+            offset: 3,
+            data: b"abc".to_vec(),
+        };
+        let unfiltered = ConnectionState::default();
+        assert!(matches!(
+            unfiltered.notification(&update),
+            Some(WebSocketResponse::ResponseBodyAppended(u)) if u.offset == 3 && u.data == "YWJj"
+        ));
+        let any_tunnel = ConnectionState {
+            filter: Some(QueryFilter::default()),
+        };
+        assert!(any_tunnel.notification(&update).is_some());
+        let other_tunnel = ConnectionState {
+            filter: Some(QueryFilter {
+                tunnel_name: Some("other".to_string()),
+                ..Default::default()
+            }),
+        };
+        assert!(other_tunnel.notification(&update).is_none());
+    }
+
+    #[tokio::test]
+    async fn get_request_returns_one_exchange() {
+        let server = start_server().await;
+        let mut ws = connect(server.port).await;
+        server
+            .app
+            .request_storage
+            .store_exchange(exchange("one", "tunnel-a"))
+            .await;
+
+        send(&mut ws, &WebSocketMessage::GetRequest("one".to_string())).await;
+        let found = next_matching(&mut ws, |r| matches!(r, WebSocketResponse::Request(_))).await;
+        assert!(matches!(found, Some(WebSocketResponse::Request(e)) if e.request.id == "one"));
+
+        send(&mut ws, &WebSocketMessage::GetRequest("none".to_string())).await;
+        let missing = next_matching(&mut ws, |r| matches!(r, WebSocketResponse::Error(_))).await;
+        assert!(matches!(missing, Some(WebSocketResponse::Error(e)) if e.contains("none")));
     }
 
     #[tokio::test]

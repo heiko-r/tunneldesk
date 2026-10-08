@@ -16,6 +16,7 @@ type RawResponse = {
   headers: { [key: string]: string };
   response_time_ms?: number;
   body: string;
+  streaming?: boolean;
 };
 
 type RawWsMessage = {
@@ -65,6 +66,7 @@ export function mapToTunneledRequest(raw: RawRequest, response?: RawResponse): T
     responseHeaders: response?.headers,
     requestBody: raw.body,
     responseBody: response?.body,
+    streaming: response?.streaming ?? false,
     replayed: raw.replayed ?? false,
     wsMessages: [],
   };

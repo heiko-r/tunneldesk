@@ -4,6 +4,9 @@ import {
   statusClass,
   fmtTime,
   fmtMs,
+  appendBase64,
+  base64ByteLength,
+  bytesToBase64,
   decodeBase64,
   encodeBase64,
   bytesToHex,
@@ -112,6 +115,39 @@ describe("decodeBase64", () => {
   it("returns empty Uint8Array for empty string", () => {
     const result = decodeBase64("");
     expect(result.length).toBe(0);
+  });
+});
+
+describe("bytesToBase64", () => {
+  it("encodes arbitrary bytes", () => {
+    expect(bytesToBase64(new Uint8Array([0, 255, 128]))).toBe("AP+A");
+    expect(bytesToBase64(new Uint8Array())).toBe("");
+  });
+});
+
+describe("base64ByteLength", () => {
+  it("counts the encoded bytes, excluding padding", () => {
+    expect(base64ByteLength("")).toBe(0);
+    expect(base64ByteLength("YQ==")).toBe(1);
+    expect(base64ByteLength("YWI=")).toBe(2);
+    expect(base64ByteLength("YWJj")).toBe(3);
+    expect(base64ByteLength("aGVsbG8=")).toBe(5);
+  });
+});
+
+describe("appendBase64", () => {
+  const bytes = (text: string) => new TextEncoder().encode(text);
+
+  it("matches encoding the concatenated bytes", () => {
+    for (const [first, second] of [
+      ["", "abc"],
+      ["a", "b"],
+      ["ab", "cdef"],
+      ["abc", "d"],
+      ["hello", ""],
+    ]) {
+      expect(appendBase64(encodeBase64(first), bytes(second))).toBe(encodeBase64(first + second));
+    }
   });
 });
 

@@ -667,14 +667,139 @@ async fn chunked_compressed_response_is_stored_decoded() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let details = mcp
-        .call_tool(id + 1, "get_request", json!({ "id": summary["id"] }))
-        .await;
+    let details = wait_for_details(&mut mcp, id + 1, &summary["id"], |d| {
+        d["response"]["streaming"] == false
+    })
+    .await;
     assert_eq!(details["body"], "{}");
     assert_eq!(
         details["response"]["body"],
         std::str::from_utf8(json).unwrap(),
         "{details}"
+    );
+
+    drop(stream);
+    env.run(&config, &["stop"]).await;
+}
+
+/// Polls `get_request` for request `id` until `done` holds for its details.
+async fn wait_for_details(
+    mcp: &mut McpHttp,
+    first_call_id: u32,
+    id: &Value,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    for call_id in first_call_id..first_call_id + 100 {
+        let details = mcp
+            .call_tool(call_id, "get_request", json!({ "id": id }))
+            .await;
+        if done(&details) {
+            return details;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("request {id} never reached the expected state");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn server_sent_events_are_visible_while_streaming() {
+    use tokio::io::AsyncReadExt as _;
+
+    let (send_second, second) = tokio::sync::oneshot::channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut request = Vec::new();
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            request.extend_from_slice(&buf[..n]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nb\r\ndata: one\n\n\r\n")
+            .await
+            .unwrap();
+        second.await.unwrap();
+        stream
+            .write_all(b"b\r\ndata: two\n\n\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+
+    let env = TestEnv::new();
+    let socket = env.dir.path().join("sse.sock");
+    let config = env.write_config(
+        "config.toml",
+        &format!(
+            "[[tunnels]]\nname = \"sse\"\ndomain = \"sse.example.com\"\nsocket_path = \"{}\"\ntarget_port = {target_port}\n",
+            socket.display()
+        ),
+    );
+    let _core = env.spawn_serve(&config);
+    let info = env.wait_for_info(&config).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || socket.exists().then_some(()))
+            .await
+            .is_some(),
+        "the tunnel socket must be created"
+    );
+
+    let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(
+            b"GET /events HTTP/1.1\r\nHost: sse.example.com\r\nAccept: text/event-stream\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut read_until = async |reply: &mut Vec<u8>, end: &[u8]| {
+        while !reply.ends_with(end) {
+            let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n > 0, "the stream closed early");
+            reply.extend_from_slice(&buf[..n]);
+        }
+    };
+    read_until(&mut reply, b"data: one\n\n\r\n").await;
+
+    let mut mcp = McpHttp::new(&info, read_token(&config));
+    mcp.initialize().await;
+    let mut id = 1;
+    let summary = loop {
+        id += 1;
+        let requests = mcp
+            .call_tool(id, "query_requests", json!({ "tunnel_name": "sse" }))
+            .await;
+        if let Some(first) = requests.as_array().and_then(|r| r.first())
+            && first["status"] == 200
+        {
+            break first.clone();
+        }
+        assert!(id < 100, "the response head was never stored: {requests}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let streaming = wait_for_details(&mut mcp, id + 1, &summary["id"], |d| {
+        d["response"]["body"] == "data: one\n\n"
+    })
+    .await;
+    assert_eq!(streaming["response"]["streaming"], true, "{streaming}");
+
+    send_second.send(()).unwrap();
+    read_until(&mut reply, b"0\r\n\r\n").await;
+    let finished = wait_for_details(&mut mcp, id + 200, &summary["id"], |d| {
+        d["response"]["streaming"] == false
+    })
+    .await;
+    assert_eq!(
+        finished["response"]["body"], "data: one\n\ndata: two\n\n",
+        "{finished}"
     );
 
     drop(stream);

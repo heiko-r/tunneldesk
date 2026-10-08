@@ -155,6 +155,8 @@ struct ResponseDetail {
     headers: HashMap<String, String>,
     body: String,
     response_time_ms: Option<f64>,
+    /// `true` while the body is still arriving.
+    streaming: bool,
 }
 
 #[derive(Serialize)]
@@ -364,6 +366,7 @@ impl TunnelDeskMcp {
                         headers: r.headers.clone(),
                         body: bytes_to_display(&r.body),
                         response_time_ms: r.response_time_ms,
+                        streaming: r.streaming,
                     }),
                 };
                 let json = serde_json::to_string_pretty(&detail)

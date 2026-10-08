@@ -1,5 +1,6 @@
 import { SvelteMap } from "svelte/reactivity";
 import type { CloudflareStatus, CoreStatus, SyncReport, Tunnel, TunneledRequest } from "./types";
+import { appendBase64, base64ByteLength, decodeBase64 } from "./utils";
 
 /** Global reactive store for all tunnels and their captured requests. */
 export const storage: { tunnels: Tunnel[]; requests: SvelteMap<string, TunneledRequest[]> } =
@@ -80,10 +81,62 @@ export function updateRequests(tunnelName: string, newRequests: TunneledRequest[
   storage.requests.set(tunnelName, newRequests);
 }
 
-/** Prepends new requests to the front of the list for a specific tunnel. */
-export function addRequests(tunnelName: string, newRequests: TunneledRequest[]) {
+/**
+ * Replaces the request with the same ID in place, or prepends it when it is
+ * new. A streaming response is pushed when its head arrives and again when it
+ * completes, so the same request can arrive more than once.
+ */
+export function upsertRequest(tunnelName: string, request: TunneledRequest) {
+  if (!replaceRequest(tunnelName, request)) {
+    storage.requests.set(tunnelName, [request, ...(storage.requests.get(tunnelName) || [])]);
+  }
+}
+
+/**
+ * Replaces the request with the same ID in place, keeping its WebSocket
+ * messages. Returns `false` when the tunnel has no such request.
+ */
+export function replaceRequest(tunnelName: string, request: TunneledRequest): boolean {
   const current = storage.requests.get(tunnelName) || [];
-  storage.requests.set(tunnelName, [...newRequests, ...current]);
+  const idx = current.findIndex((r) => r.id === request.id);
+  if (idx === -1) return false;
+  const updated = [...current];
+  updated[idx] = { ...request, wsMessages: current[idx].wsMessages };
+  storage.requests.set(tunnelName, updated);
+  return true;
+}
+
+/**
+ * Outcome of applying a streamed body append: `"gap"` means bytes before
+ * `offset` are missing, so the request must be fetched again.
+ */
+export type AppendResult = "applied" | "ignored" | "gap";
+
+/**
+ * Appends base64 `data` at byte `offset` to the body of a streaming response.
+ * Appends for unknown or completed requests and already-applied bytes are ignored.
+ */
+export function appendResponseBody(
+  tunnelName: string,
+  requestId: string,
+  offset: number,
+  data: string,
+): AppendResult {
+  const requests = storage.requests.get(tunnelName);
+  const idx = requests?.findIndex((r) => r.id === requestId) ?? -1;
+  if (!requests || idx === -1 || !requests[idx].streaming) return "ignored";
+  const body = requests[idx].responseBody ?? "";
+  const length = base64ByteLength(body);
+  if (offset > length) return "gap";
+  const bytes = decodeBase64(data);
+  if (offset + bytes.length <= length) return "ignored";
+  const updated = [...requests];
+  updated[idx] = {
+    ...requests[idx],
+    responseBody: appendBase64(body, bytes.subarray(length - offset)),
+  };
+  storage.requests.set(tunnelName, updated);
+  return "applied";
 }
 
 /**

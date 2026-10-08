@@ -1,11 +1,6 @@
 /** Encodes a string to base64 using UTF-8. */
 export function encodeBase64(text: string): string {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
+  return bytesToBase64(new TextEncoder().encode(text));
 }
 
 /** Decodes a base64 string to a Uint8Array. Returns an empty array on failure. */
@@ -20,6 +15,34 @@ export function decodeBase64(base64: string): Uint8Array {
   } catch {
     return new Uint8Array();
   }
+}
+
+/** Encodes bytes to base64. */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+/** Number of bytes encoded by a padded base64 string. */
+export function base64ByteLength(base64: string): number {
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return (base64.length / 4) * 3 - padding;
+}
+
+/**
+ * Appends `bytes` to the data encoded by `base64`. Only the final, possibly
+ * padded group is re-encoded, so appending stays cheap for long bodies.
+ */
+export function appendBase64(base64: string, bytes: Uint8Array): string {
+  if (!base64.endsWith("=")) return base64 + bytesToBase64(bytes);
+  const tail = decodeBase64(base64.slice(-4));
+  const combined = new Uint8Array(tail.length + bytes.length);
+  combined.set(tail);
+  combined.set(bytes, tail.length);
+  return base64.slice(0, -4) + bytesToBase64(combined);
 }
 
 /** Converts a Uint8Array to a space-separated hex string. */

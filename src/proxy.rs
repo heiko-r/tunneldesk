@@ -13,6 +13,7 @@ use tokio::net::UnixListener;
 
 use crate::capture::Capture;
 use crate::config::TunnelConfig;
+use crate::http_body::ChunkedFraming;
 
 /// Streaming HTTP/WebSocket capture state machine.
 ///
@@ -45,9 +46,9 @@ enum TeeReaderState {
     /// buffering them so that the connection continues to be proxied normally.
     DrainBody { bytes_remaining: usize },
 
-    /// Buffering a `Transfer-Encoding: chunked` body (framing included, so the
-    /// capture worker can decode it) until the message ends or `max_body_size`
-    /// body bytes are buffered.
+    /// Buffering a chunked request body (framing included, so the capture
+    /// worker can decode it) until the message ends or `max_body_size` body
+    /// bytes are buffered.
     ChunkedBody {
         header_end: usize,
         /// `buf[..parsed_to]` has been fed through `framing`.
@@ -55,17 +56,20 @@ enum TeeReaderState {
         framing: ChunkedFraming,
     },
 
-    /// Capture has been dispatched for a chunked message that exceeds
+    /// Capture has been dispatched for a chunked request that exceeds
     /// `max_body_size`; tracking its framing without buffering to find its end.
     ChunkedDrain { framing: ChunkedFraming },
 
-    /// A response without `Content-Length` or chunked framing: its body ends
-    /// when the connection closes.  Buffering up to `max_body_size` bytes.
-    UntilClose { header_end: usize },
-
-    /// The rest of the stream belongs to an `UntilClose` body that has already
-    /// been captured.
-    IgnoreRest,
+    /// A response whose length is not known up front (chunked, or ending when
+    /// the connection closes).  Its head has been dispatched, and body bytes
+    /// are dispatched as they are read, so that streams such as server-sent
+    /// events can be inspected while they are running.
+    StreamingBody {
+        /// `None` when the body ends with the connection.
+        framing: Option<ChunkedFraming>,
+        /// Body bytes still to dispatch before `max_body_size` is reached.
+        capture_remaining: usize,
+    },
 }
 
 /// How the body of an HTTP/1.1 message is delimited (RFC 9112 §6.3).
@@ -144,97 +148,6 @@ impl MessageHead {
             (Some(length), _) => BodyFraming::Length(length),
             (None, Some(_)) => BodyFraming::UntilClose,
         }
-    }
-}
-
-/// Incremental parser for `Transfer-Encoding: chunked` framing.  It only finds
-/// where a message ends; the capture worker decodes the captured bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkedFraming {
-    /// Reading a chunk-size line.  `in_ext` is set once a non-hex byte (the
-    /// start of a chunk extension) was seen; the rest of the line is ignored.
-    Size {
-        size: usize,
-        in_ext: bool,
-    },
-    Data {
-        remaining: usize,
-    },
-    /// Skipping the line break after chunk data.
-    DataEnd,
-    /// Reading the trailer section after the last chunk, which ends with an
-    /// empty line.
-    Trailer {
-        line_len: usize,
-    },
-}
-
-impl ChunkedFraming {
-    const START: Self = Self::Size {
-        size: 0,
-        in_ext: false,
-    };
-
-    /// Consumes `data`.  Returns `Some(n)` when the message ends after the
-    /// first `n` bytes, or `None` when all of `data` belongs to the message.
-    fn advance(&mut self, data: &[u8]) -> Option<usize> {
-        let mut i = 0;
-        while i < data.len() {
-            match *self {
-                Self::Data { remaining } => {
-                    let take = remaining.min(data.len() - i);
-                    i += take;
-                    *self = if take == remaining {
-                        Self::DataEnd
-                    } else {
-                        Self::Data {
-                            remaining: remaining - take,
-                        }
-                    };
-                }
-                Self::Size { size, in_ext } => {
-                    let byte = data[i];
-                    i += 1;
-                    *self = match byte {
-                        b'\n' if size == 0 => Self::Trailer { line_len: 0 },
-                        b'\n' => Self::Data { remaining: size },
-                        b'\r' => continue,
-                        _ if in_ext => continue,
-                        _ => match (byte as char).to_digit(16) {
-                            Some(digit) => Self::Size {
-                                size: size.saturating_mul(16).saturating_add(digit as usize),
-                                in_ext,
-                            },
-                            None => Self::Size { size, in_ext: true },
-                        },
-                    };
-                }
-                Self::DataEnd => {
-                    if data[i] == b'\n' {
-                        *self = Self::START;
-                    }
-                    i += 1;
-                }
-                Self::Trailer { line_len } => {
-                    let byte = data[i];
-                    i += 1;
-                    match byte {
-                        b'\n' if line_len == 0 => {
-                            *self = Self::START;
-                            return Some(i);
-                        }
-                        b'\n' => *self = Self::Trailer { line_len: 0 },
-                        b'\r' => {}
-                        _ => {
-                            *self = Self::Trailer {
-                                line_len: line_len + 1,
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
@@ -404,13 +317,29 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                                         capture_limit: content_length.min(self.max_body_size),
                                     }
                                 }
-                                BodyFraming::Chunked => TeeReaderState::ChunkedBody {
-                                    header_end,
-                                    parsed_to: header_end,
-                                    framing: ChunkedFraming::START,
-                                },
-                                BodyFraming::UntilClose => {
-                                    TeeReaderState::UntilClose { header_end }
+                                BodyFraming::Chunked if head.status.is_none() => {
+                                    TeeReaderState::ChunkedBody {
+                                        header_end,
+                                        parsed_to: header_end,
+                                        framing: ChunkedFraming::START,
+                                    }
+                                }
+                                framing @ (BodyFraming::Chunked | BodyFraming::UntilClose) => {
+                                    let started = self.capture.enqueue_stream_start(
+                                        self.tunnel_name.clone(),
+                                        self.connection_id.clone(),
+                                        self.buf[..header_end].to_vec(),
+                                    );
+                                    self.buf.drain(0..header_end);
+                                    TeeReaderState::StreamingBody {
+                                        framing: (framing == BodyFraming::Chunked)
+                                            .then_some(ChunkedFraming::START),
+                                        capture_remaining: if started {
+                                            self.max_body_size
+                                        } else {
+                                            0
+                                        },
+                                    }
                                 }
                             };
                             // Loop: the buffer may already hold body bytes or
@@ -504,19 +433,22 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                     }
                 },
 
-                // ── Buffering a body that ends with the connection ────────
-                TeeReaderState::UntilClose { header_end } => {
-                    self.buf.extend_from_slice(remaining);
-                    let capture_end = header_end.saturating_add(self.max_body_size);
-                    if self.buf.len() >= capture_end {
-                        self.dispatch_http_message(self.buf[..capture_end].to_vec());
-                        self.release_buf();
-                        self.state = TeeReaderState::IgnoreRest;
+                // ── Dispatching a streaming response body as it arrives ───
+                TeeReaderState::StreamingBody { .. } => {
+                    // Body bytes read together with the head are still in `buf`.
+                    if !self.buf.is_empty() {
+                        let pending = std::mem::take(&mut self.buf);
+                        if let Some(consumed) = self.stream_body(&pending) {
+                            self.buf = pending;
+                            self.buf.drain(0..consumed);
+                            continue;
+                        }
                     }
-                    break;
+                    match self.stream_body(remaining) {
+                        Some(consumed) => remaining = &remaining[consumed..],
+                        None => break,
+                    }
                 }
-
-                TeeReaderState::IgnoreRest => break,
 
                 // ── Counting remaining body bytes without buffering ────────
                 TeeReaderState::DrainBody { bytes_remaining } => {
@@ -538,8 +470,44 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
         }
     }
 
-    /// Called at the end of the stream: dispatches a message whose body was
-    /// ended (`UntilClose`) or cut short by the connection closing.
+    /// Dispatches the body bytes of the current streaming response found in
+    /// `data`.  Returns `Some(n)` when the response ends after the first `n`
+    /// bytes, after which the reader is ready for the next message.
+    fn stream_body(&mut self, data: &[u8]) -> Option<usize> {
+        let TeeReaderState::StreamingBody {
+            mut framing,
+            capture_remaining,
+        } = self.state
+        else {
+            return None;
+        };
+        let end = framing.as_mut().and_then(|f| f.advance(data));
+        let body = &data[..end.unwrap_or(data.len())];
+        let captured = body.len().min(capture_remaining);
+        let mut capture_remaining = capture_remaining - captured;
+        // After a dropped event the stored body could only continue with a
+        // gap, so it ends at the last delivered byte instead.
+        if captured > 0
+            && !self
+                .capture
+                .enqueue_stream_data(self.connection_id.clone(), body[..captured].to_vec())
+        {
+            capture_remaining = 0;
+        }
+        self.state = if end.is_some() {
+            self.capture.enqueue_stream_end(self.connection_id.clone());
+            TeeReaderState::FindingHeaders { scan_pos: 0 }
+        } else {
+            TeeReaderState::StreamingBody {
+                framing,
+                capture_remaining,
+            }
+        };
+        end
+    }
+
+    /// Called at the end of the stream: completes a message whose body ended
+    /// with the connection, or was cut short by it.
     fn finish(&mut self) {
         let capture_end = match self.state {
             TeeReaderState::CollectingBody {
@@ -547,9 +515,13 @@ impl<R: AsyncRead + Unpin> TeeReader<R> {
                 capture_limit,
                 ..
             } => header_end + capture_limit,
-            TeeReaderState::ChunkedBody { header_end, .. }
-            | TeeReaderState::UntilClose { header_end } => {
+            TeeReaderState::ChunkedBody { header_end, .. } => {
                 header_end.saturating_add(self.max_body_size)
+            }
+            TeeReaderState::StreamingBody { .. } => {
+                self.capture.enqueue_stream_end(self.connection_id.clone());
+                self.state = TeeReaderState::FindingHeaders { scan_pos: 0 };
+                return;
             }
             _ => return,
         };
@@ -1543,50 +1515,25 @@ mod tests {
         assert!(!plain.websocket_upgrade);
     }
 
-    // ── ChunkedFraming ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_chunked_framing_finds_message_end() {
-        let body = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\nNEXT";
-        let mut framing = ChunkedFraming::START;
-        assert_eq!(framing.advance(body), Some(body.len() - 4));
-        assert_eq!(framing, ChunkedFraming::START);
-    }
-
-    #[test]
-    fn test_chunked_framing_byte_by_byte() {
-        let body = b"a;ext=1\r\n0123456789\r\n0\r\nTrailer: x\r\n\r\n";
-        let mut framing = ChunkedFraming::START;
-        for (i, byte) in body.iter().enumerate() {
-            let result = framing.advance(std::slice::from_ref(byte));
-            if i == body.len() - 1 {
-                assert_eq!(result, Some(1));
-            } else {
-                assert_eq!(result, None, "byte {i}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_chunked_framing_chunk_data_resembling_terminator() {
-        // Chunk data containing "0\r\n\r\n" must not end the message.
-        let body = b"5\r\n0\r\n\r\n\r\n0\r\n\r\n";
-        let mut framing = ChunkedFraming::START;
-        assert_eq!(framing.advance(body), Some(body.len()));
-    }
-
-    #[test]
-    fn test_chunked_framing_incomplete() {
-        let mut framing = ChunkedFraming::START;
-        assert_eq!(framing.advance(b"10\r\nonly part"), None);
-        assert_eq!(framing, ChunkedFraming::Data { remaining: 7 });
-    }
-
     // ── Dispatched messages ───────────────────────────────────────────────
 
+    /// A capture event, with consecutive stream data coalesced.
+    #[derive(Debug, PartialEq)]
+    enum Dispatched {
+        Message(Vec<u8>),
+        StreamStart(Vec<u8>),
+        StreamData(Vec<u8>),
+        StreamEnd,
+    }
+
     /// Runs `data` through a TeeReader delivering `chunk_size` bytes per read
-    /// and returns the raw HTTP messages it dispatched for capture.
-    async fn dispatched(data: &[u8], max_body_size: usize, chunk_size: usize) -> Vec<Vec<u8>> {
+    /// and returns the HTTP capture events it dispatched.
+    async fn capture_events(
+        data: &[u8],
+        max_body_size: usize,
+        chunk_size: usize,
+    ) -> Vec<Dispatched> {
+        use crate::capture::CaptureEvent;
         let (capture, mut rx) = Capture::new_for_testing_channel();
         let mut reader = TeeReader::new(
             MockReader::with_chunk_size(data.to_vec(), chunk_size),
@@ -1599,39 +1546,105 @@ mod tests {
         let forwarded = read_all(&mut reader).await;
         assert_eq!(forwarded, data, "all bytes must be forwarded unchanged");
         drop(reader);
-        let mut messages = Vec::new();
+        let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
-            if let crate::capture::CaptureEvent::HttpMessage { raw, .. } = event {
-                messages.push(raw);
-            }
+            let event = match event {
+                CaptureEvent::HttpMessage { raw, .. } => Dispatched::Message(raw),
+                CaptureEvent::HttpStreamStart { raw_head, .. } => Dispatched::StreamStart(raw_head),
+                CaptureEvent::HttpStreamData { raw, .. } => {
+                    if let Some(Dispatched::StreamData(previous)) = events.last_mut() {
+                        previous.extend_from_slice(&raw);
+                        continue;
+                    }
+                    Dispatched::StreamData(raw)
+                }
+                CaptureEvent::HttpStreamEnd { .. } => Dispatched::StreamEnd,
+                CaptureEvent::WebSocketFrame { .. } => continue,
+            };
+            events.push(event);
         }
-        messages
+        events
     }
 
-    const CHUNKED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n";
+    /// The raw HTTP messages dispatched for capture as a whole.
+    async fn dispatched(data: &[u8], max_body_size: usize, chunk_size: usize) -> Vec<Vec<u8>> {
+        capture_events(data, max_body_size, chunk_size)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                Dispatched::Message(raw) => Some(raw),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const CHUNKED_HEAD: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const CHUNKED_BODY: &[u8] = b"7\r\n{\"a\":1}\r\n0\r\n\r\n";
+
+    fn chunked_response() -> Vec<u8> {
+        [CHUNKED_HEAD, CHUNKED_BODY].concat()
+    }
 
     #[tokio::test]
-    async fn test_chunked_response_is_captured_with_body() {
+    async fn test_chunked_response_is_streamed() {
         for chunk_size in [1, 7, 4096] {
-            let messages = dispatched(CHUNKED_RESPONSE, 65536, chunk_size).await;
             assert_eq!(
-                messages,
-                vec![CHUNKED_RESPONSE.to_vec()],
+                capture_events(&chunked_response(), 65536, chunk_size).await,
+                vec![
+                    Dispatched::StreamStart(CHUNKED_HEAD.to_vec()),
+                    Dispatched::StreamData(CHUNKED_BODY.to_vec()),
+                    Dispatched::StreamEnd,
+                ],
                 "chunk size {chunk_size}"
             );
         }
     }
 
     #[tokio::test]
+    async fn test_stream_head_is_dispatched_before_the_body_arrives() {
+        let (capture, mut rx) = Capture::new_for_testing_channel();
+        let (mut upstream, downstream) = tokio::io::duplex(4096);
+        let mut reader = TeeReader::new(
+            downstream,
+            capture,
+            "test".to_string(),
+            "conn".to_string(),
+            "←".to_string(),
+            65536,
+        );
+        let mut buf = vec![0u8; 4096];
+        upstream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: 1\n\n")
+            .await
+            .unwrap();
+        let n = reader.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::capture::CaptureEvent::HttpStreamStart { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::capture::CaptureEvent::HttpStreamData { raw, .. }) if raw == b"data: 1\n\n"
+        ));
+        assert!(rx.try_recv().is_err(), "the stream has not ended yet");
+    }
+
+    #[tokio::test]
     async fn test_message_after_chunked_response_is_captured() {
         let second = b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
-        let mut data = CHUNKED_RESPONSE.to_vec();
+        let mut data = chunked_response();
         data.extend_from_slice(second);
         for chunk_size in [1, 13, 4096] {
-            let messages = dispatched(&data, 65536, chunk_size).await;
             assert_eq!(
-                messages,
-                vec![CHUNKED_RESPONSE.to_vec(), second.to_vec()],
+                capture_events(&data, 65536, chunk_size).await,
+                vec![
+                    Dispatched::StreamStart(CHUNKED_HEAD.to_vec()),
+                    Dispatched::StreamData(CHUNKED_BODY.to_vec()),
+                    Dispatched::StreamEnd,
+                    Dispatched::Message(second.to_vec()),
+                ],
                 "chunk size {chunk_size}"
             );
         }
@@ -1640,29 +1653,40 @@ mod tests {
     #[tokio::test]
     async fn test_chunked_response_beyond_limit_is_truncated_then_resyncs() {
         let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let mut data = header.to_vec();
+        let mut body = Vec::new();
         for _ in 0..10 {
-            data.extend_from_slice(b"10\r\n0123456789abcdef\r\n");
+            body.extend_from_slice(b"10\r\n0123456789abcdef\r\n");
         }
-        data.extend_from_slice(b"0\r\n\r\n");
+        body.extend_from_slice(b"0\r\n\r\n");
         let second = b"HTTP/1.1 204 No Content\r\n\r\n";
-        data.extend_from_slice(second);
+        let data = [&header[..], &body, second].concat();
 
         for chunk_size in [1, 30, 4096] {
-            let messages = dispatched(&data, 50, chunk_size).await;
-            assert_eq!(messages.len(), 2, "chunk size {chunk_size}");
-            assert_eq!(messages[0], data[..header.len() + 50]);
-            assert_eq!(messages[1], second);
+            assert_eq!(
+                capture_events(&data, 50, chunk_size).await,
+                vec![
+                    Dispatched::StreamStart(header.to_vec()),
+                    Dispatched::StreamData(body[..50].to_vec()),
+                    Dispatched::StreamEnd,
+                    Dispatched::Message(second.to_vec()),
+                ],
+                "chunk size {chunk_size}"
+            );
         }
     }
 
     #[tokio::test]
-    async fn test_response_without_length_is_captured_at_close() {
-        let data = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close";
+    async fn test_response_without_length_streams_until_close() {
+        let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let data = [&header[..], b"body until close"].concat();
         for chunk_size in [1, 4096] {
             assert_eq!(
-                dispatched(data, 65536, chunk_size).await,
-                vec![data.to_vec()]
+                capture_events(&data, 65536, chunk_size).await,
+                vec![
+                    Dispatched::StreamStart(header.to_vec()),
+                    Dispatched::StreamData(b"body until close".to_vec()),
+                    Dispatched::StreamEnd,
+                ]
             );
         }
     }
@@ -1674,8 +1698,14 @@ mod tests {
         data.extend_from_slice(&[b'x'; 500]);
         // Bytes after the body limit are not parsed as further messages.
         data.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
-        let messages = dispatched(&data, 100, 64).await;
-        assert_eq!(messages, vec![data[..header.len() + 100].to_vec()]);
+        assert_eq!(
+            capture_events(&data, 100, 64).await,
+            vec![
+                Dispatched::StreamStart(header.to_vec()),
+                Dispatched::StreamData(vec![b'x'; 100]),
+                Dispatched::StreamEnd,
+            ]
+        );
     }
 
     #[tokio::test]

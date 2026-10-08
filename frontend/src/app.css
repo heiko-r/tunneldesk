@@ -180,6 +180,34 @@ body {
   white-space: nowrap;
 }
 
+/* A response whose body is still streaming in. */
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  background: rgba(61, 220, 132, 0.12);
+  color: var(--green);
+  border: 1px solid rgba(61, 220, 132, 0.35);
+  padding: 1px 4px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.live-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: live-pulse 1.2s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
 /* ── Shared code block ── */
 .code-block {
   background: var(--bg2);
